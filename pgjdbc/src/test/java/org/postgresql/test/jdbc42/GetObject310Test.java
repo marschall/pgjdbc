@@ -12,9 +12,16 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.OffsetDateTime;
+import java.time.ZoneId;
 import java.time.ZoneOffset;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.TimeZone;
 
 public class GetObject310Test extends TestCase {
+
+  private static final TimeZone saveTZ = TimeZone.getDefault();
 
   private static final ZoneOffset UTC = ZoneOffset.UTC; // +0000 always
   private static final ZoneOffset GMT03 = ZoneOffset.of("+03:00"); // +0300 always
@@ -38,6 +45,7 @@ public class GetObject310Test extends TestCase {
   }
 
   protected void tearDown() throws SQLException {
+    TimeZone.setDefault(saveTZ);
     TestUtil.dropTable(_conn, "table1");
     TestUtil.closeDB( _conn );
   }
@@ -82,17 +90,59 @@ public class GetObject310Test extends TestCase {
    * Test the behavior getObject for timestamp columns.
    */
   public void testGetLocalDateTime() throws SQLException {
-    Statement stmt = _conn.createStatement();
-    stmt.executeUpdate(TestUtil.insertSQL("table1","timestamp_without_time_zone_column","TIMESTAMP '2004-10-19 10:23:54'"));
+    List<String> zoneIdsToTest = new ArrayList<String>();
+    zoneIdsToTest.add("Africa/Casablanca"); // It is something like GMT+0..GMT+1
+    zoneIdsToTest.add("America/Adak"); // It is something like GMT-10..GMT-9
+    zoneIdsToTest.add("Atlantic/Azores"); // It is something like GMT-1..GMT+0
+    zoneIdsToTest.add("Europe/Moscow"); // It is something like GMT+3..GMT+4 for 2000s
+    zoneIdsToTest.add("Pacific/Apia"); // It is something like GMT+13..GMT+14
+    zoneIdsToTest.add("Pacific/Niue"); // It is something like GMT-11..GMT-11
+    for (int i = -12; i <= 13; i++) {
+      zoneIdsToTest.add(String.format("GMT%+02d", i));
+    }
 
-    ResultSet rs = stmt.executeQuery(TestUtil.selectSQL("table1", "timestamp_without_time_zone_column"));
+    List<String> datesToTest = Arrays.asList("2015-09-03T12:00:00", "2015-06-30T23:59:58",
+            "1997-06-30T23:59:59", "1997-07-01T00:00:00", "2012-06-30T23:59:59", "2012-07-01T00:00:00",
+            "2015-06-30T23:59:59", "2015-07-01T00:00:00", "2005-12-31T23:59:59", "2006-01-01T00:00:00",
+            "2008-12-31T23:59:59", "2009-01-01T00:00:00", /* "2015-06-30T23:59:60", */ "2015-07-31T00:00:00",
+            "2015-07-31T00:00:01",
+
+            // On 2000-03-26 02:00:00 Moscow went to DST, thus local time became 03:00:00
+            "2000-03-26T01:59:59", "2000-03-26T02:00:00", "2000-03-26T02:00:01", "2000-03-26T02:59:59",
+            "2000-03-26T03:00:00", "2000-03-26T03:00:01", "2000-03-26T03:59:59", "2000-03-26T04:00:00",
+            "2000-03-26T04:00:01",
+
+            // On 2000-10-29 03:00:00 Moscow went to regular time, thus local time became 02:00:00
+            "2000-10-29T01:59:59", "2000-10-29T02:00:00", "2000-10-29T02:00:01", "2000-10-29T02:59:59",
+            "2000-10-29T03:00:00", "2000-10-29T03:00:01", "2000-10-29T03:59:59", "2000-10-29T04:00:00",
+            "2000-10-29T04:00:01");
+
+    for (String zoneId : zoneIdsToTest) {
+      ZoneId zone = ZoneId.of(zoneId);
+      for (String date : datesToTest) {
+        localTimestamps(zone, date);
+      }
+    }
+  }
+
+  public void localTimestamps(ZoneId zoneId, String timestamp) throws SQLException {
+    TimeZone.setDefault(TimeZone.getTimeZone(zoneId));
+    Statement stmt = _conn.createStatement();
     try {
-      assertTrue(rs.next());
-      LocalDateTime localDateTime = LocalDateTime.of(2004, 10, 19, 10, 23, 54);
-      assertEquals(localDateTime, rs.getObject("timestamp_without_time_zone_column", LocalDateTime.class));
-      assertEquals(localDateTime, rs.getObject(1, LocalDateTime.class));
+      stmt.executeUpdate(TestUtil.insertSQL("table1","timestamp_without_time_zone_column","TIMESTAMP '" + timestamp + "'"));
+
+      ResultSet rs = stmt.executeQuery(TestUtil.selectSQL("table1", "timestamp_without_time_zone_column"));
+      try {
+        assertTrue(rs.next());
+        LocalDateTime localDateTime = LocalDateTime.parse(timestamp);
+        assertEquals(localDateTime, rs.getObject("timestamp_without_time_zone_column", LocalDateTime.class));
+        assertEquals(localDateTime, rs.getObject(1, LocalDateTime.class));
+      } finally {
+        rs.close();
+      }
+      stmt.executeUpdate("DELETE FROM table1");
     } finally {
-      rs.close();
+      stmt.close();
     }
   }
 
