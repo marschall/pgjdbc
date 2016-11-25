@@ -15,10 +15,12 @@ import org.postgresql.util.PSQLState;
 import java.io.InputStream;
 import java.io.Reader;
 import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.sql.Array;
 import java.sql.Blob;
 import java.sql.CallableStatement;
 import java.sql.Clob;
+import java.sql.Date;
 import java.sql.NClob;
 import java.sql.Ref;
 import java.sql.ResultSet;
@@ -30,6 +32,7 @@ import java.sql.Timestamp;
 import java.sql.Types;
 import java.util.Calendar;
 import java.util.Map;
+import java.util.UUID;
 
 class PgCallableStatement extends PgPreparedStatement implements CallableStatement {
   // Used by the callablestatement style methods
@@ -680,10 +683,165 @@ class PgCallableStatement extends PgPreparedStatement implements CallableStateme
   }
 
   public <T> T getObject(int parameterIndex, Class<T> type) throws SQLException {
-    if (type == ResultSet.class) {
+    if (type == null) {
+      throw new SQLException("type is null");
+    }
+    checkIndex(parameterIndex);
+    int sqlType = functionReturnType[parameterIndex - 1];
+    if (type == BigDecimal.class) {
+      if (sqlType == Types.NUMERIC || sqlType == Types.DECIMAL) {
+        return type.cast(getBigDecimal(parameterIndex));
+      } else {
+        throw new PSQLException(GT.tr("conversion to {0} from {1} not supported", type, sqlType),
+                PSQLState.INVALID_PARAMETER_VALUE);
+      }
+    } else if (type == String.class) {
+      if (sqlType == Types.CHAR || sqlType == Types.VARCHAR) {
+        return type.cast(getString(parameterIndex));
+      } else {
+        throw new PSQLException(GT.tr("conversion to {0} from {1} not supported", type, sqlType),
+                PSQLState.INVALID_PARAMETER_VALUE);
+      }
+    } else if (type == Boolean.class) {
+      if (sqlType == Types.BOOLEAN || sqlType == Types.BIT) {
+        boolean booleanValue = getBoolean(parameterIndex);
+        if (wasNull()) {
+          return null;
+        }
+        return type.cast(booleanValue);
+      } else {
+        throw new PSQLException(GT.tr("conversion to {0} from {1} not supported", type, sqlType),
+                PSQLState.INVALID_PARAMETER_VALUE);
+      }
+    } else if (type == Short.class) {
+      if (sqlType == Types.SMALLINT) {
+        short shortValue = getShort(parameterIndex);
+        if (wasNull()) {
+          return null;
+        }
+        return type.cast(shortValue);
+      } else {
+        throw new PSQLException(GT.tr("conversion to {0} from {1} not supported", type, sqlType),
+                PSQLState.INVALID_PARAMETER_VALUE);
+      }
+    } else if (type == Integer.class) {
+      if (sqlType == Types.INTEGER || sqlType == Types.SMALLINT) {
+        int intValue = getInt(parameterIndex);
+        if (wasNull()) {
+          return null;
+        }
+        return type.cast(intValue);
+      } else {
+        throw new PSQLException(GT.tr("conversion to {0} from {1} not supported", type, sqlType),
+                PSQLState.INVALID_PARAMETER_VALUE);
+      }
+    } else if (type == Long.class) {
+      if (sqlType == Types.BIGINT) {
+        long longValue = getLong(parameterIndex);
+        if (wasNull()) {
+          return null;
+        }
+        return type.cast(longValue);
+      } else {
+        throw new PSQLException(GT.tr("conversion to {0} from {1} not supported", type, sqlType),
+                PSQLState.INVALID_PARAMETER_VALUE);
+      }
+    } else if (type == BigInteger.class) {
+      if (sqlType == Types.BIGINT) {
+        long longValue = getLong(parameterIndex);
+        if (wasNull()) {
+          return null;
+        }
+        return type.cast(BigInteger.valueOf(longValue));
+      } else {
+        throw new PSQLException(GT.tr("conversion to {0} from {1} not supported", type, sqlType),
+                PSQLState.INVALID_PARAMETER_VALUE);
+      }
+    } else if (type == Float.class) {
+      if (sqlType == Types.REAL) {
+        float floatValue = getFloat(parameterIndex);
+        if (wasNull()) {
+          return null;
+        }
+        return type.cast(floatValue);
+      } else {
+        throw new PSQLException(GT.tr("conversion to {0} from {1} not supported", type, sqlType),
+                PSQLState.INVALID_PARAMETER_VALUE);
+      }
+    } else if (type == Double.class) {
+      if (sqlType == Types.FLOAT || sqlType == Types.DOUBLE) {
+        double doubleValue = getDouble(parameterIndex);
+        if (wasNull()) {
+          return null;
+        }
+        return type.cast(doubleValue);
+      } else {
+        throw new PSQLException(GT.tr("conversion to {0} from {1} not supported", type, sqlType),
+                PSQLState.INVALID_PARAMETER_VALUE);
+      }
+    } else if (type == Date.class) {
+      if (sqlType == Types.DATE) {
+        return type.cast(getDate(parameterIndex));
+      } else {
+        throw new PSQLException(GT.tr("conversion to {0} from {1} not supported", type, sqlType),
+                PSQLState.INVALID_PARAMETER_VALUE);
+      }
+    } else if (type == Time.class) {
+      if (sqlType == Types.TIME) {
+        return type.cast(getTime(parameterIndex));
+      } else {
+        throw new PSQLException(GT.tr("conversion to {0} from {1} not supported", type, sqlType),
+                PSQLState.INVALID_PARAMETER_VALUE);
+      }
+    } else if (type == Timestamp.class) {
+      if (sqlType == Types.TIMESTAMP
+              //#if mvn.project.property.postgresql.jdbc.spec >= "JDBC4.2"
+              || sqlType == Types.TIMESTAMP_WITH_TIMEZONE
+      //#endif
+      ) {
+        return type.cast(getTimestamp(parameterIndex));
+      } else {
+        throw new PSQLException(GT.tr("conversion to {0} from {1} not supported", type, sqlType),
+                PSQLState.INVALID_PARAMETER_VALUE);
+      }
+    } else if (type == Calendar.class) {
+      if (sqlType == Types.TIMESTAMP) {
+        Timestamp timestampValue = getTimestamp(parameterIndex);
+        Calendar calendar = Calendar.getInstance(getDefaultCalendar().getTimeZone());
+        calendar.setTimeInMillis(timestampValue.getTime());
+        return type.cast(calendar);
+      } else {
+        throw new PSQLException(GT.tr("conversion to {0} from {1} not supported", type, sqlType),
+                PSQLState.INVALID_PARAMETER_VALUE);
+      }
+    } else if (type == java.util.Date.class) {
+      if (sqlType == Types.TIMESTAMP) {
+        Timestamp timestamp = getTimestamp(parameterIndex);
+        return type.cast(new java.util.Date(timestamp.getTime()));
+      } else {
+        throw new PSQLException(GT.tr("conversion to {0} from {1} not supported", type, sqlType),
+                PSQLState.INVALID_PARAMETER_VALUE);
+      }
+    } else if (type == Array.class) {
+      if (sqlType == Types.ARRAY) {
+        return type.cast(getArray(parameterIndex));
+      } else {
+        throw new PSQLException(GT.tr("conversion to {0} from {1} not supported", type, sqlType),
+                PSQLState.INVALID_PARAMETER_VALUE);
+      }
+    } else if (type == SQLXML.class) {
+      if (sqlType == Types.SQLXML) {
+        return type.cast(getSQLXML(parameterIndex));
+      } else {
+        throw new PSQLException(GT.tr("conversion to {0} from {1} not supported", type, sqlType),
+                PSQLState.INVALID_PARAMETER_VALUE);
+      }
+    } else if (type == UUID.class) {
+      return type.cast(getObject(parameterIndex));
+    } else if (type == ResultSet.class) {
       return type.cast(getObject(parameterIndex));
     }
-    throw new PSQLException(GT.tr("Unsupported type conversion to {1}.", type),
+    throw new PSQLException(GT.tr("conversion to {0} from {1} not supported", type, sqlType),
             PSQLState.INVALID_PARAMETER_VALUE);
   }
 
