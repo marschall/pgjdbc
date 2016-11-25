@@ -206,7 +206,12 @@ public class DatabaseMetaDataTest {
     assertTrue(rs.next());
     assertEquals("metadatatest", rs.getString("TABLE_NAME"));
     assertEquals("updated", rs.getString("COLUMN_NAME"));
-    assertEquals(java.sql.Types.TIMESTAMP, rs.getInt("DATA_TYPE"));
+    //#if mvn.project.property.postgresql.jdbc.spec <= "JDBC4.1"
+    assertEquals(Types.TIMESTAMP, rs.getInt("DATA_TYPE"));
+    //#endif
+    //#if mvn.project.property.postgresql.jdbc.spec >= "JDBC4.2"
+    assertEquals(Types.TIMESTAMP_WITH_TIMEZONE, rs.getInt("DATA_TYPE"));
+    //#endif
   }
 
   @Test
@@ -782,7 +787,12 @@ public class DatabaseMetaDataTest {
     assertTrue(rs.next());
     assertEquals("c", rs.getString(4));
     assertEquals(DatabaseMetaData.procedureColumnOut, rs.getInt(5));
+    //#if mvn.project.property.postgresql.jdbc.spec <= "JDBC4.1"
     assertEquals(Types.TIMESTAMP, rs.getInt(6));
+    //#endif
+    //#if mvn.project.property.postgresql.jdbc.spec >= "JDBC4.2"
+    assertEquals(Types.TIMESTAMP_WITH_TIMEZONE, rs.getInt(6));
+    //#endif
 
     rs.close();
   }
@@ -810,7 +820,12 @@ public class DatabaseMetaDataTest {
     assertTrue(rs.next());
     assertEquals("updated", rs.getString(4));
     assertEquals(DatabaseMetaData.procedureColumnResult, rs.getInt(5));
+    //#if mvn.project.property.postgresql.jdbc.spec <= "JDBC4.1"
     assertEquals(Types.TIMESTAMP, rs.getInt(6));
+    //#endif
+    //#if mvn.project.property.postgresql.jdbc.spec >= "JDBC4.2"
+    assertEquals(Types.TIMESTAMP_WITH_TIMEZONE, rs.getInt(6));
+    //#endif
 
     assertTrue(rs.next());
     assertEquals("colour", rs.getString(4));
