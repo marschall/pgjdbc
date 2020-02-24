@@ -16,6 +16,7 @@ import org.postgresql.core.QueryExecutor;
 import org.postgresql.core.ResultCursor;
 import org.postgresql.core.ResultHandlerBase;
 import org.postgresql.core.SqlCommand;
+import org.postgresql.core.Tuple;
 import org.postgresql.util.GT;
 import org.postgresql.util.PSQLException;
 import org.postgresql.util.PSQLState;
@@ -125,7 +126,7 @@ public class PgStatement implements Statement, BaseStatement {
   /**
    * The first unclosed result.
    */
-  protected ResultWrapper firstUnclosedResult = null;
+  protected volatile ResultWrapper firstUnclosedResult = null;
 
   /**
    * Results returned by a statement that wants generated keys.
@@ -136,6 +137,8 @@ public class PgStatement implements Statement, BaseStatement {
 
   protected int maxFieldSize = 0;
 
+  protected boolean adaptiveFetch = false;
+
   PgStatement(PgConnection c, int rsType, int rsConcurrency, int rsHoldability)
       throws SQLException {
     this.connection = c;
@@ -144,14 +147,15 @@ public class PgStatement implements Statement, BaseStatement {
     concurrency = rsConcurrency;
     setFetchSize(c.getDefaultFetchSize());
     setPrepareThreshold(c.getPrepareThreshold());
+    setAdaptiveFetch(c.getAdaptiveFetch());
     this.rsHoldability = rsHoldability;
   }
 
-  public ResultSet createResultSet(Query originalQuery, Field[] fields, List<byte[][]> tuples,
+  public ResultSet createResultSet(Query originalQuery, Field[] fields, List<Tuple> tuples,
       ResultCursor cursor) throws SQLException {
     PgResultSet newResult = new PgResultSet(originalQuery, this, fields, tuples, cursor,
         getMaxRows(), getMaxFieldSize(), getResultSetType(), getResultSetConcurrency(),
-        getResultSetHoldability());
+        getResultSetHoldability(), getAdaptiveFetch());
     newResult.setFetchSize(getFetchSize());
     newResult.setFetchDirection(getFetchDirection());
     return newResult;
@@ -198,7 +202,7 @@ public class PgStatement implements Statement, BaseStatement {
     }
 
     @Override
-    public void handleResultRows(Query fromQuery, Field[] fields, List<byte[][]> tuples,
+    public void handleResultRows(Query fromQuery, Field[] fields, List<Tuple> tuples,
         ResultCursor cursor) {
       try {
         ResultSet rs = PgStatement.this.createResultSet(fromQuery, fields, tuples, cursor);
@@ -327,9 +331,9 @@ public class PgStatement implements Statement, BaseStatement {
     // Close any existing resultsets associated with this statement.
     synchronized (this) {
       while (firstUnclosedResult != null) {
-        ResultSet rs = firstUnclosedResult.getResultSet();
+        PgResultSet rs = (PgResultSet)firstUnclosedResult.getResultSet();
         if (rs != null) {
-          rs.close();
+          rs.closeInternally();
         }
         firstUnclosedResult = firstUnclosedResult.getNext();
       }
@@ -408,6 +412,9 @@ public class PgStatement implements Statement, BaseStatement {
     if (connection.getAutoCommit()) {
       flags |= QueryExecutor.QUERY_SUPPRESS_BEGIN;
     }
+    if (connection.hintReadOnly()) {
+      flags |= QueryExecutor.QUERY_READ_ONLY_HINT;
+    }
 
     // updateable result sets do not yet support binary updates
     if (concurrency != ResultSet.CONCUR_READ_ONLY) {
@@ -442,7 +449,7 @@ public class PgStatement implements Statement, BaseStatement {
     try {
       startTimer();
       connection.getQueryExecutor().execute(queryToExecute, queryParameters, handler, maxrows,
-          fetchSize, flags);
+          fetchSize, flags, adaptiveFetch);
     } finally {
       killTimerTask();
     }
@@ -810,6 +817,9 @@ public class PgStatement implements Statement, BaseStatement {
     if (connection.getAutoCommit()) {
       flags |= QueryExecutor.QUERY_SUPPRESS_BEGIN;
     }
+    if (connection.hintReadOnly()) {
+      flags |= QueryExecutor.QUERY_READ_ONLY_HINT;
+    }
 
     BatchResultHandler handler;
     handler = createBatchHandler(queries, parameterLists);
@@ -842,7 +852,7 @@ public class PgStatement implements Statement, BaseStatement {
     try {
       startTimer();
       connection.getQueryExecutor().execute(queries, parameterLists, handler, maxrows, fetchSize,
-          flags);
+          flags, adaptiveFetch);
     } finally {
       killTimerTask();
       // There might be some rows generated even in case of failures
@@ -1178,7 +1188,7 @@ public class PgStatement implements Statement, BaseStatement {
     synchronized (this) {
       checkClosed();
       if (generatedKeys == null || generatedKeys.getResultSet() == null) {
-        return createDriverResultSet(new Field[0], new ArrayList<byte[][]>());
+        return createDriverResultSet(new Field[0], new ArrayList<Tuple>());
       }
 
       return generatedKeys.getResultSet();
@@ -1243,12 +1253,22 @@ public class PgStatement implements Statement, BaseStatement {
     return rsHoldability;
   }
 
-  public ResultSet createDriverResultSet(Field[] fields, List<byte[][]> tuples)
+  public ResultSet createDriverResultSet(Field[] fields, List<Tuple> tuples)
       throws SQLException {
     return createResultSet(null, fields, tuples, null);
   }
 
   protected void transformQueriesAndParameters() throws SQLException {
+  }
+
+  @Override
+  public void setAdaptiveFetch(boolean adaptiveFetch) {
+    this.adaptiveFetch = adaptiveFetch;
+  }
+
+  @Override
+  public boolean getAdaptiveFetch() {
+    return adaptiveFetch;
   }
 
 }

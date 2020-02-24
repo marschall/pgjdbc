@@ -5,8 +5,10 @@
 
 package org.postgresql.core;
 
+import org.postgresql.util.ByteStreamWriter;
 import org.postgresql.util.GT;
 import org.postgresql.util.HostSpec;
+import org.postgresql.util.PGPropertyMaxResultBufferParser;
 import org.postgresql.util.PSQLException;
 import org.postgresql.util.PSQLState;
 
@@ -23,6 +25,7 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.sql.SQLException;
+
 import javax.net.SocketFactory;
 
 /**
@@ -51,6 +54,11 @@ public class PGStream implements Closeable, Flushable {
 
   private Encoding encoding;
   private Writer encodingWriter;
+
+  private long maxResultBuffer = -1;
+  private long resultBufferByteCount = 0;
+
+  private int maxRowSize = -1;
 
   /**
    * Constructor: Connect to the PostgreSQL back end and return a stream connection.
@@ -130,13 +138,16 @@ public class PGStream implements Closeable, Flushable {
     }
 
     int soTimeout = getNetworkTimeout();
-    setNetworkTimeout(1);
+    connection.setSoTimeout(1);
     try {
+      if (!pgInput.ensureBytes(1, false)) {
+        return false;
+      }
       available = (pgInput.peek() != -1);
     } catch (SocketTimeoutException e) {
       return false;
     } finally {
-      setNetworkTimeout(soTimeout);
+      connection.setSoTimeout(soTimeout);
     }
 
     /*
@@ -311,6 +322,32 @@ public class PGStream implements Closeable, Flushable {
   }
 
   /**
+   * Send a fixed-size array of bytes to the backend. If {@code length < siz}, pad with zeros. If
+   * {@code length > siz}, truncate the array.
+   *
+   * @param writer the stream writer to invoke to send the bytes
+   * @throws IOException if an I/O error occurs
+   */
+  public void send(ByteStreamWriter writer) throws IOException {
+    final FixedLengthOutputStream fixedLengthStream = new FixedLengthOutputStream(writer.getLength(), pgOutput);
+    try {
+      writer.writeTo(new ByteStreamWriter.ByteStreamTarget() {
+        @Override
+        public OutputStream getOutputStream() {
+          return fixedLengthStream;
+        }
+      });
+    } catch (IOException ioe) {
+      throw ioe;
+    } catch (Exception re) {
+      throw new IOException("Error writing bytes to stream", re);
+    }
+    for (int i = fixedLengthStream.remaining(); i > 0; i--) {
+      pgOutput.write(0);
+    }
+  }
+
+  /**
    * Receives a single character from the backend, without advancing the current protocol stream
    * position.
    *
@@ -435,12 +472,18 @@ public class PGStream implements Closeable, Flushable {
    *
    * @return tuple from the back end
    * @throws IOException if a data I/O error occurs
+   * @throws SQLException if read more bytes than set maxResultBuffer
    */
-  public byte[][] receiveTupleV3() throws IOException, OutOfMemoryError {
-    receiveInteger4(); // MESSAGE SIZE
+  public Tuple receiveTupleV3() throws IOException, OutOfMemoryError, SQLException {
+    int messageSize = receiveInteger4(); // MESSAGE SIZE
     int nf = receiveInteger2();
+    //size = messageSize - 4 bytes of message size - 2 bytes of field count - 4 bytes for each column length
+    int dataToReadSize = messageSize - 4 - 2 - 4 * nf;
+    setMaxRowSize(dataToReadSize);
+
     byte[][] answer = new byte[nf][];
 
+    increaseByteCounter(dataToReadSize);
     OutOfMemoryError oom = null;
     for (int i = 0; i < nf; ++i) {
       int size = receiveInteger4();
@@ -459,7 +502,7 @@ public class PGStream implements Closeable, Flushable {
       throw oom;
     }
 
-    return answer;
+    return new Tuple(answer);
   }
 
   /**
@@ -540,7 +583,6 @@ public class PGStream implements Closeable, Flushable {
     }
   }
 
-
   /**
    * Flush any pending output to the backend.
    *
@@ -587,9 +629,91 @@ public class PGStream implements Closeable, Flushable {
 
   public void setNetworkTimeout(int milliseconds) throws IOException {
     connection.setSoTimeout(milliseconds);
+    pgInput.setTimeoutRequested(milliseconds != 0);
   }
 
   public int getNetworkTimeout() throws IOException {
     return connection.getSoTimeout();
+  }
+
+  /**
+   * Method to set MaxResultBuffer inside PGStream.
+   *
+   * @param value value of new max result buffer as string (cause we can expect % or chars to use
+   *              multiplier)
+   * @throws PSQLException exception returned when occurred parsing problem.
+   */
+  public void setMaxResultBuffer(String value) throws PSQLException {
+    maxResultBuffer = PGPropertyMaxResultBufferParser.parseProperty(value);
+  }
+
+  /**
+   * Method to get MaxResultBuffer from PGStream.
+   *
+   * @return size of MaxResultBuffer
+   */
+  public long getMaxResultBuffer() {
+    return maxResultBuffer;
+  }
+
+  /**
+   * The idea behind this method is to keep in maxRowSize the size of biggest read data row. As
+   * there may be many data rows send after each other for a query, then value in maxRowSize would
+   * contain value noticed so far, because next data rows and their sizes are not read for that
+   * moment. We want it increasing, because the size of the biggest among data rows will be used
+   * during computing new adaptive fetch size for the query.
+   *
+   * @param rowSize new value to be set as maxRowSize
+   */
+  public void setMaxRowSize(int rowSize) {
+    if (rowSize > maxRowSize) {
+      maxRowSize = rowSize;
+    }
+  }
+
+  /**
+   * Method to get actual max row size noticed so far.
+   *
+   * @return value of max row size
+   */
+  public int getMaxRowSize() {
+    return maxRowSize;
+  }
+
+  /**
+   * Method to clear value of max row size noticed so far.
+   */
+  public void clearMaxRowSize() {
+    maxRowSize = -1;
+  }
+
+  /**
+   * Method to clear count of byte buffer.
+   */
+  public void clearResultBufferCount() {
+    resultBufferByteCount = 0;
+  }
+
+  /**
+   * Method to increase actual count of buffer. If buffer count is bigger than max result buffer
+   * limit, then gonna return an exception.
+   *
+   * @param value size of bytes to add to byte buffer.
+   * @throws SQLException exception returned when result buffer count is bigger than max result
+   *                          buffer.
+   */
+  private void increaseByteCounter(long value) throws SQLException {
+    if (maxResultBuffer != -1) {
+      resultBufferByteCount += value;
+      if (resultBufferByteCount > maxResultBuffer) {
+        throw new PSQLException(GT.tr(
+          "Result set exceeded maxResultBuffer limit. Received:  {0}; Current limit: {1}",
+          String.valueOf(resultBufferByteCount), String.valueOf(maxResultBuffer)),PSQLState.COMMUNICATION_ERROR);
+      }
+    }
+  }
+
+  public boolean isClosed() {
+    return connection.isClosed();
   }
 }

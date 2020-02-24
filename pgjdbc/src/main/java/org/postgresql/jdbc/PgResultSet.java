@@ -15,6 +15,7 @@ import org.postgresql.core.Oid;
 import org.postgresql.core.Query;
 import org.postgresql.core.ResultCursor;
 import org.postgresql.core.ResultHandlerBase;
+import org.postgresql.core.Tuple;
 import org.postgresql.core.TypeInfo;
 import org.postgresql.core.Utils;
 import org.postgresql.util.ByteConverter;
@@ -35,6 +36,7 @@ import java.io.Reader;
 import java.io.UnsupportedEncodingException;
 import java.math.BigDecimal;
 import java.math.BigInteger;
+import java.math.RoundingMode;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.sql.Array;
@@ -100,10 +102,10 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
   protected final int maxRows; // Maximum rows in this resultset (might be 0).
   protected final int maxFieldSize; // Maximum field size in this resultset (might be 0).
 
-  protected List<byte[][]> rows; // Current page of results.
+  protected List<Tuple> rows; // Current page of results.
   protected int currentRow = -1; // Index into 'rows' of our currrent row (0-based)
   protected int rowOffset; // Offset of row 0 in the actual resultset
-  protected byte[][] thisRow; // copy of the current result row
+  protected Tuple thisRow; // copy of the current result row
   protected SQLWarning warnings = null; // The warning chain
   /**
    * True if the last obtained column value was SQL NULL as specified by {@link #wasNull}. The value
@@ -113,9 +115,11 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
   protected boolean onInsertRow = false;
   // are we on the insert row (for JDBC2 updatable resultsets)?
 
-  private byte[][] rowBuffer = null; // updateable rowbuffer
+  private Tuple rowBuffer = null; // updateable rowbuffer
 
   protected int fetchSize; // Current fetch size (might be 0).
+  protected int lastUsedFetchSize; // Fetch size used during last fetch
+  protected boolean adaptiveFetch = false;
   protected ResultCursor cursor; // Cursor for fetching additional data.
 
   private Map<String, Integer> columnNameIndexMap; // Speed up findColumn by caching lookups
@@ -134,9 +138,9 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
     return rsMetaData;
   }
 
-  PgResultSet(Query originalQuery, BaseStatement statement, Field[] fields, List<byte[][]> tuples,
+  PgResultSet(Query originalQuery, BaseStatement statement, Field[] fields, List<Tuple> tuples,
       ResultCursor cursor, int maxRows, int maxFieldSize, int rsType, int rsConcurrency,
-      int rsHoldability) throws SQLException {
+      int rsHoldability, boolean adaptiveFetch) throws SQLException {
     // Fail-fast on invalid null inputs
     if (tuples == null) {
       throw new NullPointerException("tuples must be non-null");
@@ -155,6 +159,10 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
     this.maxFieldSize = maxFieldSize;
     this.resultsettype = rsType;
     this.resultsetconcurrency = rsConcurrency;
+    this.adaptiveFetch = adaptiveFetch;
+
+    //Constructor doesn't have fetch size and can't be sure if fetch size was used so initial value would be the number of rows
+    this.lastUsedFetchSize = tuples.size();
   }
 
   public java.net.URL getURL(int columnIndex) throws SQLException {
@@ -220,7 +228,7 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
 
         if (type.equals("uuid")) {
           if (isBinary(columnIndex)) {
-            return getUUID(thisRow[columnIndex - 1]);
+            return getUUID(thisRow.get(columnIndex - 1));
           }
           return getUUID(getString(columnIndex));
         }
@@ -260,7 +268,7 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
         }
         if ("hstore".equals(type)) {
           if (isBinary(columnIndex)) {
-            return HStoreConverter.fromBytes(thisRow[columnIndex - 1], connection.getEncoding());
+            return HStoreConverter.fromBytes(thisRow.get(columnIndex - 1), connection.getEncoding());
           }
           return HStoreConverter.fromString(getString(columnIndex));
         }
@@ -385,7 +393,7 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
 
     int oid = fields[i - 1].getOID();
     if (isBinary(i)) {
-      return makeArray(oid, thisRow[i - 1]);
+      return makeArray(oid, thisRow.get(i - 1));
     }
     return makeArray(oid, getFixedString(i));
   }
@@ -471,7 +479,7 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
       int oid = fields[col].getOID();
       TimeZone tz = cal.getTimeZone();
       if (oid == Oid.DATE) {
-        return connection.getTimestampUtils().toDateBin(tz, thisRow[col]);
+        return connection.getTimestampUtils().toDateBin(tz, thisRow.get(col));
       } else if (oid == Oid.TIMESTAMP || oid == Oid.TIMESTAMPTZ) {
         // If backend provides just TIMESTAMP, we use "cal" timezone
         // If backend provides TIMESTAMPTZ, we ignore "cal" as we know true instant value
@@ -504,7 +512,7 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
       int oid = fields[col].getOID();
       TimeZone tz = cal.getTimeZone();
       if (oid == Oid.TIME || oid == Oid.TIMETZ) {
-        return connection.getTimestampUtils().toTimeBin(tz, thisRow[col]);
+        return connection.getTimestampUtils().toTimeBin(tz, thisRow.get(col));
       } else if (oid == Oid.TIMESTAMP || oid == Oid.TIMESTAMPTZ) {
         // If backend provides just TIMESTAMP, we use "cal" timezone
         // If backend provides TIMESTAMPTZ, we ignore "cal" as we know true instant value
@@ -540,7 +548,7 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
       int col = i - 1;
       int oid = fields[col].getOID();
       if (oid == Oid.TIME) {
-        return connection.getTimestampUtils().toLocalTimeBin(thisRow[col]);
+        return connection.getTimestampUtils().toLocalTimeBin(thisRow.get(col));
       } else {
         throw new PSQLException(
             GT.tr("Cannot convert the column of type {0} to requested type {1}.",
@@ -570,7 +578,7 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
       if (oid == Oid.TIMESTAMPTZ || oid == Oid.TIMESTAMP) {
         boolean hasTimeZone = oid == Oid.TIMESTAMPTZ;
         TimeZone tz = cal.getTimeZone();
-        return connection.getTimestampUtils().toTimestampBin(tz, thisRow[col], hasTimeZone);
+        return connection.getTimestampUtils().toTimestampBin(tz, thisRow.get(col), hasTimeZone);
       } else {
         // JDBC spec says getTimestamp of Time and Date must be supported
         long millis;
@@ -611,7 +619,7 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
 
     if (isBinary(i)) {
       if (oid == Oid.TIMESTAMPTZ || oid == Oid.TIMESTAMP) {
-        return connection.getTimestampUtils().toOffsetDateTimeBin(thisRow[col]);
+        return connection.getTimestampUtils().toOffsetDateTimeBin(thisRow.get(col));
       } else if (oid == Oid.TIMETZ) {
         // JDBC spec says timetz must be supported
         Time time = getTime(i);
@@ -653,7 +661,7 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
               PSQLState.DATA_TYPE_MISMATCH);
     }
     if (isBinary(i)) {
-      return connection.getTimestampUtils().toLocalDateTimeBin(thisRow[col]);
+      return connection.getTimestampUtils().toLocalDateTimeBin(thisRow.get(col));
     }
 
     String string = getString(i);
@@ -813,6 +821,13 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
 
     // Work out how many rows maxRows will let us fetch.
     int fetchRows = fetchSize;
+    int adaptiveFetchRows = connection.getQueryExecutor()
+        .getAdaptiveFetchSize(adaptiveFetch, cursor);
+
+    if (adaptiveFetchRows != -1) {
+      fetchRows = adaptiveFetchRows;
+    }
+
     if (maxRows != 0) {
       if (fetchRows == 0 || rowOffset + fetchRows > maxRows) {
         // Fetch would exceed maxRows, limit it.
@@ -821,7 +836,11 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
     }
 
     // Do the actual fetch.
-    connection.getQueryExecutor().fetch(cursor, new CursorResultHandler(), fetchRows);
+    connection.getQueryExecutor()
+        .fetch(cursor, new CursorResultHandler(), fetchRows, adaptiveFetch);
+
+    //After fetch, update last used fetch size (could be useful during adaptive fetch).
+    lastUsedFetchSize = fetchRows;
 
     // Now prepend our one saved row and move to it.
     rows.add(0, thisRow);
@@ -942,11 +961,8 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
           PSQLState.INVALID_CURSOR_STATE);
     }
 
-
     int numKeys = primaryKeys.size();
     if (deleteStatement == null) {
-
-
       StringBuilder deleteSQL =
           new StringBuilder("DELETE FROM ").append(onlyTable).append(tableName).append(" where ");
 
@@ -965,7 +981,6 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
     for (int i = 0; i < numKeys; i++) {
       deleteStatement.setObject(i + 1, primaryKeys.get(i).getValue());
     }
-
 
     deleteStatement.executeUpdate();
 
@@ -1039,8 +1054,6 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
 
       // need to clear this in case of another insert
       clearRowBuffer(false);
-
-
     }
   }
 
@@ -1067,27 +1080,25 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
       insertStatement = null;
     }
 
-
     // make sure the underlying data is null
     clearRowBuffer(false);
 
     onInsertRow = true;
     doingUpdates = false;
-
   }
 
+  // rowBuffer is the temporary storage for the row
   private synchronized void clearRowBuffer(boolean copyCurrentRow) throws SQLException {
-    // rowBuffer is the temporary storage for the row
-    rowBuffer = new byte[fields.length][];
 
     // inserts want an empty array while updates want a copy of the current row
     if (copyCurrentRow) {
-      System.arraycopy(thisRow, 0, rowBuffer, 0, thisRow.length);
+      rowBuffer = thisRow.updateableCopy();
+    } else {
+      rowBuffer = new Tuple(fields.length);
     }
 
     // clear the updateValues hash map for the next set of updates
     updateValues.clear();
-
   }
 
   public boolean rowDeleted() throws SQLException {
@@ -1251,7 +1262,6 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
 
   public synchronized void updateObject(int columnIndex, Object x, int scale) throws SQLException {
     this.updateObject(columnIndex, x);
-
   }
 
   @Override
@@ -1298,7 +1308,6 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
     selectStatement = connection.prepareStatement(sqlText,
         ResultSet.TYPE_SCROLL_INSENSITIVE, ResultSet.CONCUR_UPDATABLE);
 
-
     for (int j = 0, i = 1; j < numKeys; j++, i++) {
       selectStatement.setObject(i, primaryKeys.get(j).getValue());
     }
@@ -1317,7 +1326,6 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
     rs.close();
     selectStatement.close();
     selectStatement = null;
-
   }
 
   @Override
@@ -1393,7 +1401,7 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
     updateRowBuffer();
 
     connection.getLogger().log(Level.FINE, "copying data");
-    System.arraycopy(rowBuffer, 0, thisRow, 0, rowBuffer.length);
+    thisRow = rowBuffer.readOnlyCopy();
     rows.set(currentRow, rowBuffer);
 
     connection.getLogger().log(Level.FINE, "done updates");
@@ -1499,7 +1507,6 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
     updateObject(findColumn(columnName), x);
   }
 
-
   /**
    * Is this ResultSet updateable?
    */
@@ -1536,7 +1543,8 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
 
     // this is not strictly jdbc spec, but it will make things much faster if used
     // the user has to select oid, * from table and then we will just use oid
-
+    // with oids has been removed in version 12
+    // FIXME: with oids does not automatically create an index, should check for primary keys first
 
     usingOID = false;
     int oidIndex = findColumnIndex("oid"); // 0 if not present
@@ -1575,7 +1583,6 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
 
     connection.getLogger().log(Level.FINE, "no of keys={0}", i);
 
-
     if (i < 1) {
       throw new PSQLException(GT.tr("No primary key found for table {0}.", tableName),
           PSQLState.DATA_ERROR);
@@ -1586,6 +1593,50 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
     connection.getLogger().log(Level.FINE, "checking primary key {0}", updateable);
 
     return updateable;
+  }
+
+  /**
+   * Method to turn on/off adaptive fetch for ResultSet.
+   *
+   * @param adaptiveFetch desired state of adaptive fetch.
+   * @throws SQLException exception returned if ResultSet is closed
+   */
+  public void setAdaptiveFetch(boolean adaptiveFetch) throws SQLException {
+    checkClosed();
+    updateQueryInsideAdaptiveFetchMonitoring(adaptiveFetch);
+    this.adaptiveFetch = adaptiveFetch;
+  }
+
+  /**
+   * Method to update adaptive fetch monitoring during changing state of adaptive fetch inside
+   * ResultSet. Update inside AdaptiveFetchMonitoring is required to collect data about max result
+   * row length for that query to compute adaptive fetch size.
+   *
+   * @param newAdaptiveFetch new state of adaptive fetch
+   */
+  private void updateQueryInsideAdaptiveFetchMonitoring(boolean newAdaptiveFetch) {
+    boolean localAdaptiveFetch = this.adaptiveFetch;
+
+    if (localAdaptiveFetch == false && newAdaptiveFetch == true) {
+      //If we are here, that means we want to be added to adaptive fetch.
+      connection.getQueryExecutor().addQueryToAdaptiveFetchMonitoring(Boolean.TRUE, cursor);
+    }
+
+    if (localAdaptiveFetch == true && newAdaptiveFetch == false) {
+      //If we are here, that means we want to be removed from adaptive fetch.
+      connection.getQueryExecutor().removeQueryFromAdaptiveFetchMonitoring(Boolean.TRUE, cursor);
+    }
+  }
+
+  /**
+   * Method to get state of adaptive fetch for resultSet.
+   *
+   * @return state of adaptive fetch (turned on or off)
+   * @throws SQLException exception returned if ResultSet is closed
+   */
+  public boolean getAdaptiveFetch() throws SQLException {
+    checkClosed();
+    return adaptiveFetch;
   }
 
   /**
@@ -1676,40 +1727,44 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
   }
 
   private void updateRowBuffer() throws SQLException {
-
     for (Map.Entry<String, Object> entry : updateValues.entrySet()) {
       int columnIndex = findColumn(entry.getKey()) - 1;
 
       Object valueObject = entry.getValue();
       if (valueObject instanceof PGobject) {
         String value = ((PGobject) valueObject).getValue();
-        rowBuffer[columnIndex] = (value == null) ? null : connection.encodeString(value);
+        rowBuffer.set(columnIndex, (value == null) ? null : connection.encodeString(value));
       } else {
         switch (getSQLType(columnIndex + 1)) {
 
-          //
-          // toString() isn't enough for date and time types; we must format it correctly
-          // or we won't be able to re-parse it.
-          //
-
+          // boolean needs to be formatted as t or f instead of true or false
+          case Types.BIT:
+          case Types.BOOLEAN:
+            rowBuffer.set(columnIndex, connection
+                .encodeString(((Boolean) valueObject).booleanValue() ? "t" : "f"));
+            break;
+            //
+            // toString() isn't enough for date and time types; we must format it correctly
+            // or we won't be able to re-parse it.
+            //
           case Types.DATE:
-            rowBuffer[columnIndex] = connection
+            rowBuffer.set(columnIndex, connection
                 .encodeString(
                     connection.getTimestampUtils().toString(
-                        getDefaultCalendar(), (Date) valueObject));
+                        getDefaultCalendar(), (Date) valueObject)));
             break;
 
           case Types.TIME:
-            rowBuffer[columnIndex] = connection
+            rowBuffer.set(columnIndex, connection
                 .encodeString(
                     connection.getTimestampUtils().toString(
-                        getDefaultCalendar(), (Time) valueObject));
+                        getDefaultCalendar(), (Time) valueObject)));
             break;
 
           case Types.TIMESTAMP:
-            rowBuffer[columnIndex] = connection.encodeString(
+            rowBuffer.set(columnIndex, connection.encodeString(
                 connection.getTimestampUtils().toString(
-                    getDefaultCalendar(), (Timestamp) valueObject));
+                    getDefaultCalendar(), (Timestamp) valueObject)));
             break;
 
           case Types.NULL:
@@ -1720,11 +1775,11 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
           case Types.LONGVARBINARY:
           case Types.VARBINARY:
             if (isBinary(columnIndex + 1)) {
-              rowBuffer[columnIndex] = (byte[]) valueObject;
+              rowBuffer.set(columnIndex, (byte[]) valueObject);
             } else {
               try {
-                rowBuffer[columnIndex] =
-                    PGbytea.toPGString((byte[]) valueObject).getBytes("ISO-8859-1");
+                rowBuffer.set(columnIndex,
+                    PGbytea.toPGString((byte[]) valueObject).getBytes("ISO-8859-1"));
               } catch (UnsupportedEncodingException e) {
                 throw new PSQLException(
                     GT.tr("The JVM claims not to support the encoding: {0}", "ISO-8859-1"),
@@ -1734,7 +1789,7 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
             break;
 
           default:
-            rowBuffer[columnIndex] = connection.encodeString(String.valueOf(valueObject));
+            rowBuffer.set(columnIndex, connection.encodeString(String.valueOf(valueObject)));
             break;
         }
 
@@ -1745,7 +1800,7 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
   public class CursorResultHandler extends ResultHandlerBase {
 
     @Override
-    public void handleResultRows(Query fromQuery, Field[] fields, List<byte[][]> tuples,
+    public void handleResultRows(Query fromQuery, Field[] fields, List<Tuple> tuples,
         ResultCursor cursor) {
       PgResultSet.this.rows = tuples;
       PgResultSet.this.cursor = cursor;
@@ -1800,7 +1855,23 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
 
   public int getFetchSize() throws SQLException {
     checkClosed();
-    return fetchSize;
+    if (adaptiveFetch) {
+      return lastUsedFetchSize;
+    } else {
+      return fetchSize;
+    }
+  }
+
+  /**
+   * Method to get fetch size used during last fetch. Returned value can be useful if using adaptive
+   * fetch.
+   *
+   * @return fetch size used during last fetch.
+   * @throws SQLException exception returned if ResultSet is closed
+   */
+  public int getLastUsedFetchSize() throws SQLException {
+    checkClosed();
+    return lastUsedFetchSize;
   }
 
   @Override
@@ -1824,6 +1895,13 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
       rowOffset += rows.size(); // We are discarding some data.
 
       int fetchRows = fetchSize;
+      int adaptiveFetchRows = connection.getQueryExecutor()
+          .getAdaptiveFetchSize(adaptiveFetch, cursor);
+
+      if (adaptiveFetchRows != -1) {
+        fetchRows = adaptiveFetchRows;
+      }
+
       if (maxRows != 0) {
         if (fetchRows == 0 || rowOffset + fetchRows > maxRows) {
           // Fetch would exceed maxRows, limit it.
@@ -1832,7 +1910,11 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
       }
 
       // Execute the fetch and update this resultset.
-      connection.getQueryExecutor().fetch(cursor, new CursorResultHandler(), fetchRows);
+      connection.getQueryExecutor()
+          .fetch(cursor, new CursorResultHandler(), fetchRows, adaptiveFetch);
+
+      //After fetch, update last used fetch size (could be useful for adaptive fetch).
+      lastUsedFetchSize = fetchRows;
 
       currentRow = 0;
 
@@ -1852,14 +1934,24 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
 
   public void close() throws SQLException {
     try {
-      // release resources held (memory for tuples)
-      rows = null;
-      if (cursor != null) {
-        cursor.close();
-        cursor = null;
-      }
+      closeInternally();
     } finally {
       ((PgStatement) statement).checkCompletion();
+    }
+  }
+
+  /*
+  used by PgStatement.closeForNextExecution to avoid
+  closing the firstUnclosedResult twice.
+  checkCompletion above modifies firstUnclosedResult
+  fixes issue #684
+   */
+  protected void closeInternally() throws SQLException {
+    // release resources held (memory for tuples)
+    rows = null;
+    if (cursor != null) {
+      cursor.close();
+      cursor = null;
     }
   }
 
@@ -1903,7 +1995,7 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
 
     Encoding encoding = connection.getEncoding();
     try {
-      return trimString(columnIndex, encoding.decode(thisRow[columnIndex - 1]));
+      return trimString(columnIndex, encoding.decode(thisRow.get(columnIndex - 1)));
     } catch (IOException ioe) {
       throw new PSQLException(
           GT.tr(
@@ -1944,12 +2036,12 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
 
     int col = columnIndex - 1;
     if (Oid.BOOL == fields[col].getOID()) {
-      final byte[] v = thisRow[col];
+      final byte[] v = thisRow.get(col);
       return (1 == v.length) && (116 == v[0]); // 116 = 't'
     }
 
     if (isBinary(columnIndex)) {
-      return BooleanTypeUtil.castToBoolean(readDoubleValue(thisRow[col], fields[col].getOID(), "boolean"));
+      return BooleanTypeUtil.castToBoolean(readDoubleValue(thisRow.get(col), fields[col].getOID(), "boolean"));
     }
 
     return BooleanTypeUtil.castToBoolean(getString(columnIndex));
@@ -1970,7 +2062,7 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
       int col = columnIndex - 1;
       // there is no Oid for byte so must always do conversion from
       // some other numeric type
-      return (byte) readLongValue(thisRow[col], fields[col].getOID(), Byte.MIN_VALUE,
+      return (byte) readLongValue(thisRow.get(col), fields[col].getOID(), Byte.MIN_VALUE,
           Byte.MAX_VALUE, "byte");
     }
 
@@ -2019,9 +2111,9 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
       int col = columnIndex - 1;
       int oid = fields[col].getOID();
       if (oid == Oid.INT2) {
-        return ByteConverter.int2(thisRow[col], 0);
+        return ByteConverter.int2(thisRow.get(col), 0);
       }
-      return (short) readLongValue(thisRow[col], oid, Short.MIN_VALUE, Short.MAX_VALUE, "short");
+      return (short) readLongValue(thisRow.get(col), oid, Short.MIN_VALUE, Short.MAX_VALUE, "short");
     }
 
     return toShort(getFixedString(columnIndex));
@@ -2039,9 +2131,9 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
       int col = columnIndex - 1;
       int oid = fields[col].getOID();
       if (oid == Oid.INT4) {
-        return ByteConverter.int4(thisRow[col], 0);
+        return ByteConverter.int4(thisRow.get(col), 0);
       }
-      return (int) readLongValue(thisRow[col], oid, Integer.MIN_VALUE, Integer.MAX_VALUE, "int");
+      return (int) readLongValue(thisRow.get(col), oid, Integer.MIN_VALUE, Integer.MAX_VALUE, "int");
     }
 
     Encoding encoding = connection.getEncoding();
@@ -2066,9 +2158,9 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
       int col = columnIndex - 1;
       int oid = fields[col].getOID();
       if (oid == Oid.INT8) {
-        return ByteConverter.int8(thisRow[col], 0);
+        return ByteConverter.int8(thisRow.get(col), 0);
       }
-      return readLongValue(thisRow[col], oid, Long.MIN_VALUE, Long.MAX_VALUE, "long");
+      return readLongValue(thisRow.get(col), oid, Long.MIN_VALUE, Long.MAX_VALUE, "long");
     }
 
     Encoding encoding = connection.getEncoding();
@@ -2111,7 +2203,7 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
    */
   private long getFastLong(int columnIndex) throws SQLException, NumberFormatException {
 
-    byte[] bytes = thisRow[columnIndex - 1];
+    byte[] bytes = thisRow.get(columnIndex - 1);
 
     if (bytes.length == 0) {
       throw FAST_NUMBER_FAILED;
@@ -2163,7 +2255,7 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
    */
   private int getFastInt(int columnIndex) throws SQLException, NumberFormatException {
 
-    byte[] bytes = thisRow[columnIndex - 1];
+    byte[] bytes = thisRow.get(columnIndex - 1);
 
     if (bytes.length == 0) {
       throw FAST_NUMBER_FAILED;
@@ -2215,7 +2307,7 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
    */
   private BigDecimal getFastBigDecimal(int columnIndex) throws SQLException, NumberFormatException {
 
-    byte[] bytes = thisRow[columnIndex - 1];
+    byte[] bytes = thisRow.get(columnIndex - 1);
 
     if (bytes.length == 0) {
       throw FAST_NUMBER_FAILED;
@@ -2279,9 +2371,9 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
       int col = columnIndex - 1;
       int oid = fields[col].getOID();
       if (oid == Oid.FLOAT4) {
-        return ByteConverter.float4(thisRow[col], 0);
+        return ByteConverter.float4(thisRow.get(col), 0);
       }
-      return (float) readDoubleValue(thisRow[col], oid, "float");
+      return (float) readDoubleValue(thisRow.get(col), oid, "float");
     }
 
     return toFloat(getFixedString(columnIndex));
@@ -2299,9 +2391,9 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
       int col = columnIndex - 1;
       int oid = fields[col].getOID();
       if (oid == Oid.FLOAT8) {
-        return ByteConverter.float8(thisRow[col], 0);
+        return ByteConverter.float8(thisRow.get(col), 0);
       }
-      return readDoubleValue(thisRow[col], oid, "double");
+      return readDoubleValue(thisRow.get(col), oid, "double");
     }
 
     return toDouble(getFixedString(columnIndex));
@@ -2331,6 +2423,13 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
           return res;
         }
         return toBigDecimal(trimMoney(String.valueOf(obj)), scale);
+      } else {
+        Number num = ByteConverter.numeric(thisRow.get(columnIndex - 1));
+        if (allowNaN && Double.isNaN(num.doubleValue())) {
+          return Double.NaN;
+        }
+
+        return num;
       }
     }
 
@@ -2370,12 +2469,12 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
 
     if (isBinary(columnIndex)) {
       // If the data is already binary then just return it
-      return thisRow[columnIndex - 1];
+      return thisRow.get(columnIndex - 1);
     }
     if (fields[columnIndex - 1].getOID() == Oid.BYTEA) {
-      return trimBytes(columnIndex, PGbytea.toBytes(thisRow[columnIndex - 1]));
+      return trimBytes(columnIndex, PGbytea.toBytes(thisRow.get(columnIndex - 1)));
     } else {
-      return trimBytes(columnIndex, thisRow[columnIndex - 1]);
+      return trimBytes(columnIndex, thisRow.get(columnIndex - 1));
     }
   }
 
@@ -2569,7 +2668,7 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
     }
 
     if (isBinary(columnIndex)) {
-      return connection.getObject(getPGType(columnIndex), null, thisRow[columnIndex - 1]);
+      return connection.getObject(getPGType(columnIndex), null, thisRow.get(columnIndex - 1));
     }
     return connection.getObject(getPGType(columnIndex), getString(columnIndex), null);
   }
@@ -2767,7 +2866,7 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
           PSQLState.INVALID_CURSOR_STATE);
     }
     checkColumnIndex(column);
-    wasNullFlag = (thisRow[column - 1] == null);
+    wasNullFlag = (thisRow.get(column - 1) == null);
   }
 
   /**
@@ -2937,8 +3036,7 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
     // We only need a copy of the current row if we're going to
     // modify it via an updatable resultset.
     if (resultsetconcurrency == ResultSet.CONCUR_UPDATABLE) {
-      rowBuffer = new byte[thisRow.length][];
-      System.arraycopy(thisRow, 0, rowBuffer, 0, thisRow.length);
+      rowBuffer = thisRow.updateableCopy();
     } else {
       rowBuffer = null;
     }
@@ -3002,6 +3100,8 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
         return ByteConverter.float4(bytes, 0);
       case Oid.FLOAT8:
         return ByteConverter.float8(bytes, 0);
+      case Oid.NUMERIC:
+        return ByteConverter.numeric(bytes).doubleValue();
     }
     throw new PSQLException(GT.tr("Cannot convert the column of type {0} to requested type {1}.",
         Oid.toString(oid), targetType), PSQLState.DATA_TYPE_MISMATCH);
@@ -3045,6 +3145,14 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
         break;
       case Oid.FLOAT8:
         val = (long) ByteConverter.float8(bytes, 0);
+        break;
+      case Oid.NUMERIC:
+        Number num = ByteConverter.numeric(bytes);
+        if (num instanceof  BigDecimal) {
+          val = ((BigDecimal) num).setScale(0 , RoundingMode.DOWN).longValueExact();
+        } else {
+          val = num.longValue();
+        }
         break;
       default:
         throw new PSQLException(
@@ -3129,7 +3237,7 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
    * Used to add rows to an already existing ResultSet that exactly match the existing rows.
    * Currently only used for assembling generated keys from batch statement execution.
    */
-  void addRows(List<byte[][]> tuples) {
+  void addRows(List<Tuple> tuples) {
     rows.addAll(tuples);
   }
 
@@ -3407,7 +3515,7 @@ public class PgResultSet implements ResultSet, org.postgresql.PGRefCursorResultS
     } else if (PGobject.class.isAssignableFrom(type)) {
       Object object;
       if (isBinary(columnIndex)) {
-        object = connection.getObject(getPGType(columnIndex), null, thisRow[columnIndex - 1]);
+        object = connection.getObject(getPGType(columnIndex), null, thisRow.get(columnIndex - 1));
       } else {
         object = connection.getObject(getPGType(columnIndex), getString(columnIndex), null);
       }

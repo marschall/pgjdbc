@@ -31,11 +31,14 @@ import org.postgresql.core.ResultHandlerDelegate;
 import org.postgresql.core.SqlCommand;
 import org.postgresql.core.SqlCommandType;
 import org.postgresql.core.TransactionState;
+import org.postgresql.core.Tuple;
 import org.postgresql.core.Utils;
+import org.postgresql.core.v3.adaptivefetch.AdaptiveFetchQueryMonitoring;
 import org.postgresql.core.v3.replication.V3ReplicationProtocol;
 import org.postgresql.jdbc.AutoSave;
 import org.postgresql.jdbc.BatchResultHandler;
 import org.postgresql.jdbc.TimestampUtils;
+import org.postgresql.util.ByteStreamWriter;
 import org.postgresql.util.GT;
 import org.postgresql.util.PSQLException;
 import org.postgresql.util.PSQLState;
@@ -61,6 +64,7 @@ import java.util.List;
 import java.util.Properties;
 import java.util.Set;
 import java.util.TimeZone;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -71,6 +75,7 @@ import java.util.logging.Logger;
 public class QueryExecutorImpl extends QueryExecutorBase {
 
   private static final Logger LOGGER = Logger.getLogger(QueryExecutorImpl.class.getName());
+  private static final String COPY_ERROR_MESSAGE = "COPY commands are only supported using the CopyManager API.";
 
   /**
    * TimeZone of the current connection (TimeZone backend parameter).
@@ -124,9 +129,14 @@ public class QueryExecutorImpl extends QueryExecutorBase {
    */
   private final CommandCompleteParser commandCompleteParser = new CommandCompleteParser();
 
+  private final AdaptiveFetchQueryMonitoring adaptiveFetchQueryMonitoring;
+
   public QueryExecutorImpl(PGStream pgStream, String user, String database,
       int cancelSignalTimeout, Properties info) throws SQLException, IOException {
     super(pgStream, user, database, cancelSignalTimeout, info);
+
+    long maxResultBuffer = pgStream.getMaxResultBuffer();
+    this.adaptiveFetchQueryMonitoring = new AdaptiveFetchQueryMonitoring(maxResultBuffer, info);
 
     this.allowEncodingChanges = PGProperty.ALLOW_ENCODING_CHANGES.getBoolean(info);
     this.cleanupSavePoints = PGProperty.CLEANUP_SAVEPOINTS.getBoolean(info);
@@ -272,6 +282,11 @@ public class QueryExecutorImpl extends QueryExecutorBase {
 
   public synchronized void execute(Query query, ParameterList parameters, ResultHandler handler,
       int maxRows, int fetchSize, int flags) throws SQLException {
+    execute(query, parameters, handler, maxRows, fetchSize, flags, false);
+  }
+
+  public synchronized void execute(Query query, ParameterList parameters, ResultHandler handler,
+      int maxRows, int fetchSize, int flags, boolean adaptiveFetch) throws SQLException {
     waitOnLock();
     if (LOGGER.isLoggable(Level.FINEST)) {
       LOGGER.log(Level.FINEST, "  simple execute, handler={0}, maxRows={1}, fetchSize={2}, flags={3}",
@@ -299,14 +314,14 @@ public class QueryExecutorImpl extends QueryExecutorBase {
         handler = sendQueryPreamble(handler, flags);
         autosave = sendAutomaticSavepoint(query, flags);
         sendQuery(query, (V3ParameterList) parameters, maxRows, fetchSize, flags,
-            handler, null);
+            handler, null, adaptiveFetch);
         if ((flags & QueryExecutor.QUERY_EXECUTE_AS_SIMPLE) != 0) {
           // Sync message is not required for 'Q' execution as 'Q' ends with ReadyForQuery message
           // on its own
         } else {
           sendSync();
         }
-        processResults(handler, flags);
+        processResults(handler, flags, adaptiveFetch);
         estimatedReceiveBufferBytes = 0;
       } catch (PGBindException se) {
         // There are three causes of this error, an
@@ -324,7 +339,7 @@ public class QueryExecutorImpl extends QueryExecutorBase {
         // transaction in progress?
         //
         sendSync();
-        processResults(handler, flags);
+        processResults(handler, flags, adaptiveFetch);
         estimatedReceiveBufferBytes = 0;
         handler
             .handleError(new PSQLException(GT.tr("Unable to bind parameter values for statement."),
@@ -370,9 +385,7 @@ public class QueryExecutorImpl extends QueryExecutorBase {
               // PostgreSQL does not support bind, exec, simple, sync message flow,
               // so we force autosavepoint to use simple if the main query is using simple
               | QUERY_EXECUTE_AS_SIMPLE);
-
       return true;
-
     }
     return false;
   }
@@ -460,6 +473,12 @@ public class QueryExecutorImpl extends QueryExecutorBase {
 
   public synchronized void execute(Query[] queries, ParameterList[] parameterLists,
       BatchResultHandler batchHandler, int maxRows, int fetchSize, int flags) throws SQLException {
+    execute(queries, parameterLists, batchHandler, maxRows, fetchSize, flags, false);
+  }
+
+  public synchronized void execute(Query[] queries, ParameterList[] parameterLists,
+      BatchResultHandler batchHandler, int maxRows, int fetchSize, int flags, boolean adaptiveFetch)
+      throws SQLException {
     waitOnLock();
     if (LOGGER.isLoggable(Level.FINEST)) {
       LOGGER.log(Level.FINEST, "  batch execute {0} queries, handler={1}, maxRows={2}, fetchSize={3}, flags={4}",
@@ -492,7 +511,7 @@ public class QueryExecutorImpl extends QueryExecutorBase {
           parameters = SimpleQuery.NO_PARAMETERS;
         }
 
-        sendQuery(query, parameters, maxRows, fetchSize, flags, handler, batchHandler);
+        sendQuery(query, parameters, maxRows, fetchSize, flags, handler, batchHandler, adaptiveFetch);
 
         if (handler.getException() != null) {
           break;
@@ -506,7 +525,7 @@ public class QueryExecutorImpl extends QueryExecutorBase {
         } else {
           sendSync();
         }
-        processResults(handler, flags);
+        processResults(handler, flags, adaptiveFetch);
         estimatedReceiveBufferBytes = 0;
       }
     } catch (IOException e) {
@@ -518,6 +537,9 @@ public class QueryExecutorImpl extends QueryExecutorBase {
 
     try {
       handler.handleCompletion();
+      if (cleanupSavePoints) {
+        releaseSavePoint(autosave, flags);
+      }
     } catch (SQLException e) {
       rollbackIfRequired(autosave, e);
     }
@@ -544,13 +566,15 @@ public class QueryExecutorImpl extends QueryExecutorBase {
 
     beginFlags = updateQueryMode(beginFlags);
 
-    sendOneQuery(beginTransactionQuery, SimpleQuery.NO_PARAMETERS, 0, 0, beginFlags);
+    final SimpleQuery beginQuery = ((flags & QueryExecutor.QUERY_READ_ONLY_HINT) == 0) ? beginTransactionQuery : beginReadOnlyTransactionQuery;
+
+    sendOneQuery(beginQuery, SimpleQuery.NO_PARAMETERS, 0, 0, beginFlags);
 
     // Insert a handler that intercepts the BEGIN.
     return new ResultHandlerDelegate(delegateHandler) {
       private boolean sawBegin = false;
 
-      public void handleResultRows(Query fromQuery, Field[] fields, List<byte[][]> tuples,
+      public void handleResultRows(Query fromQuery, Field[] fields, List<Tuple> tuples,
           ResultCursor cursor) {
         if (sawBegin) {
           super.handleResultRows(fromQuery, fields, tuples, cursor);
@@ -626,8 +650,12 @@ public class QueryExecutorImpl extends QueryExecutorBase {
       };
 
       try {
-        sendOneQuery(beginTransactionQuery, SimpleQuery.NO_PARAMETERS, 0, 0,
-            QueryExecutor.QUERY_NO_METADATA);
+        /* Send BEGIN with simple protocol preferred */
+        int beginFlags = QueryExecutor.QUERY_NO_METADATA
+                         | QueryExecutor.QUERY_ONESHOT
+                         | QueryExecutor.QUERY_EXECUTE_AS_SIMPLE;
+        beginFlags = updateQueryMode(beginFlags);
+        sendOneQuery(beginTransactionQuery, SimpleQuery.NO_PARAMETERS, 0, 0, beginFlags);
         sendSync();
         processResults(handler, 0);
         estimatedReceiveBufferBytes = 0;
@@ -665,7 +693,6 @@ public class QueryExecutorImpl extends QueryExecutorBase {
         encodedSize += 4 + params.getV3Length(i);
       }
     }
-
 
     pgStream.sendChar('F');
     pgStream.sendInteger4(4 + 4 + 2 + 2 * paramCount + 2 + encodedSize + 2);
@@ -713,7 +740,7 @@ public class QueryExecutorImpl extends QueryExecutorBase {
     long startTime = 0;
     int oldTimeout = 0;
     if (useTimeout) {
-      startTime = System.currentTimeMillis();
+      startTime = TimeUnit.NANOSECONDS.toMillis(System.nanoTime());
       try {
         oldTimeout = pgStream.getSocket().getSoTimeout();
       } catch (SocketException e) {
@@ -743,7 +770,7 @@ public class QueryExecutorImpl extends QueryExecutorBase {
             SQLWarning warning = receiveNoticeResponse();
             addWarning(warning);
             if (useTimeout) {
-              long newTimeMillis = System.currentTimeMillis();
+              long newTimeMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime());
               timeoutMillis += startTime - newTimeMillis; // Overflows after 49 days, ignore that
               startTime = newTimeMillis;
               if (timeoutMillis == 0) {
@@ -772,9 +799,9 @@ public class QueryExecutorImpl extends QueryExecutorBase {
     try {
       Socket s = pgStream.getSocket();
       if (!s.isClosed()) { // Is this check required?
-        pgStream.getSocket().setSoTimeout(millis);
+        pgStream.setNetworkTimeout(millis);
       }
-    } catch (SocketException e) {
+    } catch (IOException e) {
       throw new PSQLException(GT.tr("An error occurred while trying to reset the socket timeout."),
         PSQLState.CONNECTION_FAILURE, e);
     }
@@ -1025,7 +1052,34 @@ public class QueryExecutorImpl extends QueryExecutorBase {
       pgStream.sendChar('d');
       pgStream.sendInteger4(siz + 4);
       pgStream.send(data, off, siz);
+    } catch (IOException ioe) {
+      throw new PSQLException(GT.tr("Database connection failed when writing to copy"),
+          PSQLState.CONNECTION_FAILURE, ioe);
+    }
+  }
 
+  /**
+   * Sends data during a live COPY IN operation. Only unlocks the connection if server suddenly
+   * returns CommandComplete, which should not happen
+   *
+   * @param op   the CopyIn operation presumably currently holding lock on this connection
+   * @param from the source of bytes, e.g. a ByteBufferByteStreamWriter
+   * @throws SQLException on failure
+   */
+  public synchronized void writeToCopy(CopyOperationImpl op, ByteStreamWriter from)
+      throws SQLException {
+    if (!hasLock(op)) {
+      throw new PSQLException(GT.tr("Tried to write to an inactive copy operation"),
+          PSQLState.OBJECT_NOT_IN_STATE);
+    }
+
+    int siz = from.getLength();
+    LOGGER.log(Level.FINEST, " FE=> CopyData({0})", siz);
+
+    try {
+      pgStream.sendChar('d');
+      pgStream.sendInteger4(siz + 4);
+      pgStream.send(from);
     } catch (IOException ioe) {
       throw new PSQLException(GT.tr("Database connection failed when writing to copy"),
           PSQLState.CONNECTION_FAILURE, ioe);
@@ -1084,6 +1138,13 @@ public class QueryExecutorImpl extends QueryExecutorBase {
       throws SQLException, IOException {
 
     /*
+    * fixes issue #1592 where one thread closes the stream and another is reading it
+     */
+    if (pgStream.isClosed()) {
+      throw new PSQLException(GT.tr("PGStream is closed",
+        op.getClass().getName()), PSQLState.CONNECTION_DOES_NOT_EXIST);
+    }
+    /*
     *  This is a hack as we should not end up here, but sometimes do with large copy operations.
      */
     if ( processingCopyResults.compareAndSet(false,true) == false ) {
@@ -1141,8 +1202,8 @@ public class QueryExecutorImpl extends QueryExecutorBase {
             try {
               if (op == null) {
                 throw new PSQLException(GT
-                  .tr("Received CommandComplete ''{0}'' without an active copy operation", status),
-                  PSQLState.OBJECT_NOT_IN_STATE);
+                    .tr("Received CommandComplete ''{0}'' without an active copy operation", status),
+                    PSQLState.OBJECT_NOT_IN_STATE);
               }
               op.handleCommandStatus(status);
             } catch (SQLException se) {
@@ -1167,7 +1228,7 @@ public class QueryExecutorImpl extends QueryExecutorBase {
 
             if (op != null) {
               error = new PSQLException(GT.tr("Got CopyInResponse from server during an active {0}",
-                op.getClass().getName()), PSQLState.OBJECT_NOT_IN_STATE);
+                  op.getClass().getName()), PSQLState.OBJECT_NOT_IN_STATE);
             }
 
             op = new CopyInImpl();
@@ -1180,8 +1241,7 @@ public class QueryExecutorImpl extends QueryExecutorBase {
             LOGGER.log(Level.FINEST, " <=BE CopyOutResponse");
 
             if (op != null) {
-              error =
-                new PSQLException(GT.tr("Got CopyOutResponse from server during an active {0}",
+              error = new PSQLException(GT.tr("Got CopyOutResponse from server during an active {0}",
                   op.getClass().getName()), PSQLState.OBJECT_NOT_IN_STATE);
             }
 
@@ -1195,8 +1255,7 @@ public class QueryExecutorImpl extends QueryExecutorBase {
             LOGGER.log(Level.FINEST, " <=BE CopyBothResponse");
 
             if (op != null) {
-              error =
-                new PSQLException(GT.tr("Got CopyBothResponse from server during an active {0}",
+              error = new PSQLException(GT.tr("Got CopyBothResponse from server during an active {0}",
                   op.getClass().getName()), PSQLState.OBJECT_NOT_IN_STATE);
             }
 
@@ -1216,11 +1275,11 @@ public class QueryExecutorImpl extends QueryExecutorBase {
             byte[] buf = pgStream.receive(len);
             if (op == null) {
               error = new PSQLException(GT.tr("Got CopyData without an active copy operation"),
-                PSQLState.OBJECT_NOT_IN_STATE);
+                  PSQLState.OBJECT_NOT_IN_STATE);
             } else if (!(op instanceof CopyOut)) {
               error = new PSQLException(
-                GT.tr("Unexpected copydata from server for {0}", op.getClass().getName()),
-                PSQLState.COMMUNICATION_ERROR);
+                  GT.tr("Unexpected copydata from server for {0}", op.getClass().getName()),
+                  PSQLState.COMMUNICATION_ERROR);
             } else {
               op.handleCopydata(buf);
             }
@@ -1238,7 +1297,7 @@ public class QueryExecutorImpl extends QueryExecutorBase {
 
             if (!(op instanceof CopyOut)) {
               error = new PSQLException("Got CopyDone while not copying from server",
-                PSQLState.OBJECT_NOT_IN_STATE);
+                  PSQLState.OBJECT_NOT_IN_STATE);
             }
 
             // keep receiving since we expect a CommandComplete
@@ -1279,7 +1338,7 @@ public class QueryExecutorImpl extends QueryExecutorBase {
 
           default:
             throw new IOException(
-              GT.tr("Unexpected packet type during copy: {0}", Integer.toString(c)));
+                GT.tr("Unexpected packet type during copy: {0}", Integer.toString(c)));
         }
 
         // Collect errors into a neat chain for completeness
@@ -1362,7 +1421,7 @@ public class QueryExecutorImpl extends QueryExecutorBase {
    */
   private void sendQuery(Query query, V3ParameterList parameters, int maxRows, int fetchSize,
       int flags, ResultHandler resultHandler,
-      BatchResultHandler batchHandler) throws IOException, SQLException {
+      BatchResultHandler batchHandler, boolean adaptiveFetch) throws IOException, SQLException {
     // Now the query itself.
     Query[] subqueries = query.getSubqueries();
     SimpleParameterList[] subparams = parameters.getSubparams();
@@ -1377,6 +1436,9 @@ public class QueryExecutorImpl extends QueryExecutorBase {
 
       // If we saw errors, don't send anything more.
       if (resultHandler.getException() == null) {
+        if (fetchSize != 0) {
+          adaptiveFetchQueryMonitoring.addNewQuery(adaptiveFetch, query);
+        }
         sendOneQuery((SimpleQuery) query, (SimpleParameterList) parameters, maxRows, fetchSize,
             flags);
       }
@@ -1399,6 +1461,9 @@ public class QueryExecutorImpl extends QueryExecutorBase {
         SimpleParameterList subparam = SimpleQuery.NO_PARAMETERS;
         if (subparams != null) {
           subparam = subparams[i];
+        }
+        if (fetchSize != 0) {
+          adaptiveFetchQueryMonitoring.addNewQuery(adaptiveFetch, subquery);
         }
         sendOneQuery((SimpleQuery) subquery, subparam, maxRows, fetchSize, flags);
       }
@@ -1983,10 +2048,15 @@ public class QueryExecutorImpl extends QueryExecutorBase {
   }
 
   protected void processResults(ResultHandler handler, int flags) throws IOException {
+    processResults(handler, flags, false);
+  }
+
+  protected void processResults(ResultHandler handler, int flags, boolean adaptiveFetch)
+      throws IOException {
     boolean noResults = (flags & QueryExecutor.QUERY_NO_RESULTS) != 0;
     boolean bothRowsAndStatus = (flags & QueryExecutor.QUERY_BOTH_ROWS_AND_STATUS) != 0;
 
-    List<byte[][]> tuples = null;
+    List<Tuple> tuples = null;
 
     int c;
     boolean endQuery = false;
@@ -2019,7 +2089,6 @@ public class QueryExecutorImpl extends QueryExecutorBase {
           pgStream.receiveInteger4(); // len, discarded
 
           LOGGER.log(Level.FINEST, " <=BE ParameterDescription");
-
 
           DescribeRequest describeData = pendingDescribeStatementQueue.getFirst();
           SimpleQuery query = describeData.query;
@@ -2081,7 +2150,7 @@ public class QueryExecutorImpl extends QueryExecutorBase {
             Field[] fields = currentQuery.getFields();
 
             if (fields != null) { // There was a resultset.
-              tuples = new ArrayList<byte[][]>();
+              tuples = new ArrayList<Tuple>();
               handler.handleResultRows(currentQuery, fields, tuples, null);
               tuples = null;
             }
@@ -2095,16 +2164,22 @@ public class QueryExecutorImpl extends QueryExecutorBase {
           pgStream.receiveInteger4(); // len, discarded
           LOGGER.log(Level.FINEST, " <=BE PortalSuspended");
 
-
           ExecuteRequest executeData = pendingExecuteQueue.removeFirst();
           SimpleQuery currentQuery = executeData.query;
           Portal currentPortal = executeData.portal;
+
+          if (currentPortal != null) {
+            // Existence of portal defines if query was using fetching.
+            adaptiveFetchQueryMonitoring
+              .updateQueryFetchSize(adaptiveFetch, currentQuery, pgStream.getMaxRowSize());
+          }
+          pgStream.clearMaxRowSize();
 
           Field[] fields = currentQuery.getFields();
           if (fields != null && tuples == null) {
             // When no results expected, pretend an empty resultset was returned
             // Not sure if new ArrayList can be always replaced with emptyList
-            tuples = noResults ? Collections.<byte[][]>emptyList() : new ArrayList<byte[][]>();
+            tuples = noResults ? Collections.<Tuple>emptyList() : new ArrayList<Tuple>();
           }
 
           handler.handleResultRows(currentQuery, fields, tuples, currentPortal);
@@ -2122,10 +2197,20 @@ public class QueryExecutorImpl extends QueryExecutorBase {
 
           doneAfterRowDescNoData = false;
 
-
           ExecuteRequest executeData = pendingExecuteQueue.peekFirst();
           SimpleQuery currentQuery = executeData.query;
           Portal currentPortal = executeData.portal;
+
+          if (currentPortal != null) {
+            //Existence of portal defines if query was using fetching.
+
+            //Command executed, adaptive fetch size can be removed for this query, max row size can be cleared
+            adaptiveFetchQueryMonitoring.removeQuery(adaptiveFetch, currentQuery);
+            //Update to change fetch size for other fetch portals of this query
+            adaptiveFetchQueryMonitoring
+              .updateQueryFetchSize(adaptiveFetch, currentQuery, pgStream.getMaxRowSize());
+          }
+          pgStream.clearMaxRowSize();
 
           if (status.startsWith("SET")) {
             String nativeSql = currentQuery.getNativeQuery().nativeSql;
@@ -2156,7 +2241,7 @@ public class QueryExecutorImpl extends QueryExecutorBase {
           if (fields != null && tuples == null) {
             // When no results expected, pretend an empty resultset was returned
             // Not sure if new ArrayList can be always replaced with emptyList
-            tuples = noResults ? Collections.<byte[][]>emptyList() : new ArrayList<byte[][]>();
+            tuples = noResults ? Collections.<Tuple>emptyList() : new ArrayList<Tuple>();
           }
 
           // If we received tuples we must know the structure of the
@@ -2193,7 +2278,7 @@ public class QueryExecutorImpl extends QueryExecutorBase {
         }
 
         case 'D': // Data Transfer (ongoing Execute response)
-          byte[][] tuple = null;
+          Tuple tuple = null;
           try {
             tuple = pgStream.receiveTupleV3();
           } catch (OutOfMemoryError oome) {
@@ -2202,12 +2287,12 @@ public class QueryExecutorImpl extends QueryExecutorBase {
                   new PSQLException(GT.tr("Ran out of memory retrieving query results."),
                       PSQLState.OUT_OF_MEMORY, oome));
             }
+          } catch (SQLException e) {
+            handler.handleError(e);
           }
-
-
           if (!noResults) {
             if (tuples == null) {
-              tuples = new ArrayList<byte[][]>();
+              tuples = new ArrayList<Tuple>();
             }
             tuples.add(tuple);
           }
@@ -2217,13 +2302,7 @@ public class QueryExecutorImpl extends QueryExecutorBase {
             if (tuple == null) {
               length = -1;
             } else {
-              length = 0;
-              for (byte[] aTuple : tuple) {
-                if (aTuple == null) {
-                  continue;
-                }
-                length += aTuple.length;
-              }
+              length = tuple.length();
             }
             LOGGER.log(Level.FINEST, " <=BE DataRow(len={0})", length);
           }
@@ -2277,7 +2356,7 @@ public class QueryExecutorImpl extends QueryExecutorBase {
 
         case 'T': // Row Description (response to Describe)
           Field[] fields = receiveFields();
-          tuples = new ArrayList<byte[][]>();
+          tuples = new ArrayList<Tuple>();
 
           SimpleQuery query = pendingDescribePortalQueue.peekFirst();
           if (!pendingExecuteQueue.isEmpty() && !pendingExecuteQueue.peekFirst().asSimple) {
@@ -2299,6 +2378,7 @@ public class QueryExecutorImpl extends QueryExecutorBase {
           receiveRFQ();
           if (!pendingExecuteQueue.isEmpty() && pendingExecuteQueue.peekFirst().asSimple) {
             tuples = null;
+            pgStream.clearResultBufferCount();
 
             ExecuteRequest executeRequest = pendingExecuteQueue.removeFirst();
             // Simple queries might return several resultsets, thus we clear
@@ -2349,8 +2429,7 @@ public class QueryExecutorImpl extends QueryExecutorBase {
           // We'll send a CopyFail message for COPY FROM STDIN so that
           // server does not wait for the data.
 
-          byte[] buf =
-              Utils.encodeUTF8("The JDBC driver currently does not support COPY operations.");
+          byte[] buf = Utils.encodeUTF8(COPY_ERROR_MESSAGE);
           pgStream.sendChar('f');
           pgStream.sendInteger4(buf.length + 4 + 1);
           pgStream.send(buf);
@@ -2367,7 +2446,7 @@ public class QueryExecutorImpl extends QueryExecutorBase {
           // In case of CopyOutResponse, we cannot abort data transfer,
           // so just throw an error and ignore CopyData messages
           handler.handleError(
-              new PSQLException(GT.tr("The driver currently does not support COPY operations."),
+              new PSQLException(GT.tr(COPY_ERROR_MESSAGE),
                   PSQLState.NOT_IMPLEMENTED));
           break;
 
@@ -2401,8 +2480,8 @@ public class QueryExecutorImpl extends QueryExecutorBase {
     pgStream.skip(len - 4);
   }
 
-  public synchronized void fetch(ResultCursor cursor, ResultHandler handler, int fetchSize)
-      throws SQLException {
+  public synchronized void fetch(ResultCursor cursor, ResultHandler handler, int fetchSize,
+      boolean adaptiveFetch) throws SQLException {
     waitOnLock();
     final Portal portal = (Portal) cursor;
 
@@ -2412,7 +2491,7 @@ public class QueryExecutorImpl extends QueryExecutorBase {
     handler = new ResultHandlerDelegate(delegateHandler) {
       @Override
       public void handleCommandStatus(String status, long updateCount, long insertOID) {
-        handleResultRows(portal.getQuery(), null, new ArrayList<byte[][]>(), null);
+        handleResultRows(portal.getQuery(), null, new ArrayList<Tuple>(), null);
       }
     };
 
@@ -2425,7 +2504,7 @@ public class QueryExecutorImpl extends QueryExecutorBase {
       sendExecute(portal.getQuery(), portal, fetchSize);
       sendSync();
 
-      processResults(handler, 0);
+      processResults(handler, 0, adaptiveFetch);
       estimatedReceiveBufferBytes = 0;
     } catch (IOException e) {
       abort();
@@ -2435,6 +2514,57 @@ public class QueryExecutorImpl extends QueryExecutorBase {
     }
 
     handler.handleCompletion();
+  }
+
+  @Override
+  public int getAdaptiveFetchSize(boolean adaptiveFetch, ResultCursor cursor) {
+    try {
+      if (cursor instanceof Portal) {
+        return adaptiveFetchQueryMonitoring
+          .getFetchSizeForQuery(adaptiveFetch, ((Portal) cursor).getQuery());
+      }
+    } catch (Exception ex) {
+      LOGGER.log(Level.WARNING,
+          "Exception returned during getting adaptive fetch size from QueryExecutorImpl:\n {0}",
+          ex.getMessage());
+    }
+    return -1;
+  }
+
+  @Override
+  public void setAdaptiveFetch(boolean adaptiveFetch) {
+    this.adaptiveFetchQueryMonitoring.setAdaptiveFetch(adaptiveFetch);
+  }
+
+  @Override
+  public boolean getAdaptiveFetch() {
+    return this.adaptiveFetchQueryMonitoring.getAdaptiveFetch();
+  }
+
+  @Override
+  public void addQueryToAdaptiveFetchMonitoring(boolean adaptiveFetch, ResultCursor cursor) {
+    try {
+      if (cursor instanceof Portal) {
+        adaptiveFetchQueryMonitoring.addNewQuery(adaptiveFetch, ((Portal) cursor).getQuery());
+      }
+    } catch (Exception ex) {
+      LOGGER.log(Level.WARNING,
+          "Exception returned during adding query to Adaptive Fetch Monitoring inside QueryExecutorImpl:\n {0}",
+          ex.getMessage());
+    }
+  }
+
+  @Override
+  public void removeQueryFromAdaptiveFetchMonitoring(boolean adaptiveFetch, ResultCursor cursor) {
+    try {
+      if (cursor instanceof Portal) {
+        adaptiveFetchQueryMonitoring.removeQuery(adaptiveFetch, ((Portal) cursor).getQuery());
+      }
+    } catch (Exception ex) {
+      LOGGER.log(Level.WARNING,
+          "Exception returned during removing query from Adaptive Fetch Monitoring inside QueryExecutorImpl:\n {0}",
+          ex.getMessage());
+    }
   }
 
   /*
@@ -2497,7 +2627,7 @@ public class QueryExecutorImpl extends QueryExecutorBase {
       LOGGER.log(Level.FINEST, " <=BE ErrorMessage({0})", errorMsg.toString());
     }
 
-    PSQLException error = new PSQLException(errorMsg);
+    PSQLException error = new PSQLException(errorMsg, this.logServerErrorDetail);
     if (transactionFailCause == null) {
       transactionFailCause = error;
     } else {
@@ -2789,6 +2919,11 @@ public class QueryExecutorImpl extends QueryExecutorBase {
           new NativeQuery("BEGIN", new int[0], false, SqlCommand.BLANK),
           null, false);
 
+  private final SimpleQuery beginReadOnlyTransactionQuery =
+      new SimpleQuery(
+          new NativeQuery("BEGIN READ ONLY", new int[0], false, SqlCommand.BLANK),
+          null, false);
+
   private final SimpleQuery emptyQuery =
       new SimpleQuery(
           new NativeQuery("", new int[0], false,
@@ -2812,7 +2947,4 @@ public class QueryExecutorImpl extends QueryExecutorBase {
       new SimpleQuery(
           new NativeQuery("ROLLBACK TO SAVEPOINT PGJDBC_AUTOSAVE", new int[0], false, SqlCommand.BLANK),
           null, false);
-
-
-
 }

@@ -4,11 +4,52 @@ Notable changes since version 42.0.0, read the complete [History of Changes](htt
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
+
+## [42.2.10] (2020-01-30)
 ### Changed
 
 ### Added
-
+ - Add maxResultBuffer property (#1657)
+ - add caller push of binary data (rebase of #953) (#1659)
+ 
 ### Fixed
+ - Cleanup PGProperty, sort values, and add some missing to docs (#1686)
+ - Fixing LocalTime rounding (losing precision) (#1570)
+ - Network Performance of PgDatabaseMetaData.getTypeInfo() method (#1668)
+ - Issue #1680 updating a boolean field requires special handling to set it to t or f instead of true or false (#1682)
+ - bug in pgstream for replication (#1681)
+ - Issue #1677 NumberFormatException when fetching PGInterval with small value (#1678)
+ - Metadata queries improvements with large schemas. (#1673)
+ - Utf 8 encoding optimizations (#1444)
+ - interval overflow (#1658)
+ - Issue #1482 where the port was being added to the GSSAPI service name (#1651)
+ - remove receiving EOF from backend after cancel since according to protocol the server closes the connection once cancel is sent (connection reset exception is always thrown) (#1641)
+ - Unable to register out parameter Issue #1646 (#1648)
+  
+## [42.2.9] (2019-12-06)
+### Changed
+
+### Added
+ - read only transactions [PR 1252](https://github.com/pgjdbc/pgjdbc/pull/1252)
+ - pkcs12 key functionality [PR 1599](https://github.com/pgjdbc/pgjdbc/pull/1599)
+ - new "escapeSyntaxCallMode" connection property [PR 1560](https://github.com/pgjdbc/pgjdbc/pull/1560)
+ - connection property to limit server error detail in exception exceptions [PR 1579](https://github.com/pgjdbc/pgjdbc/pull/1579)
+ - cancelQuery() to PGConnection public interface [PR 1157](https://github.com/pgjdbc/pgjdbc/pull/1157) 
+ - support for large update counts (JDBC 4.2) [PR 935](https://github.com/pgjdbc/pgjdbc/pull/935)
+ - Add Binary Support for Oid.NUMERIC and Oid.NUMERIC_ARRAY [PR 1636](https://github.com/pgjdbc/pgjdbc/pull/1636) 
+ 
+### Fixed
+ - issue 716 getTypeInfo() may not return data in the order specified in Oracle documentation [PR 1506](https://github.com/pgjdbc/pgjdbc/pull/1506)
+ - PgSQLXML setCharacterStream() results in null value  [PR 1608](https://github.com/pgjdbc/pgjdbc/pull/1608)
+ - get correct column length for simple domains [PR 1605](https://github.com/pgjdbc/pgjdbc/pull/1605)
+ - NPE as a result of calling executeQuery twice on a statement fixes issue [#684](https://github.com/pgjdbc/pgjdbc/issues/684) [PR 1610] (https://github.com/pgjdbc/pgjdbc/pull/1610)
+ - handle numeric domain types [PR 1611](https://github.com/pgjdbc/pgjdbc/pull/1611) 
+ - pginterval to take iso8601 strings [PR 1612](https://github.com/pgjdbc/pgjdbc/pull/1612)
+ - remove currentTimeMillis from code, tests are OK [PR 1617](https://github.com/pgjdbc/pgjdbc/pull/1617) 
+ - NPE when calling setNull on a PreparedStatement with no parameters [PR 1620](https://github.com/pgjdbc/pgjdbc/pull/1620)
+ - allow OUT parameter registration when using CallableStatement native CALL [PR 1561](https://github.com/pgjdbc/pgjdbc/pull/1561)
+ - add release save point into execute with batch [PR 1583](https://github.com/pgjdbc/pgjdbc/pull/1583) 
+ - Prevent use of extended query protocol for BEGIN before COPY [PR 1639](https://github.com/pgjdbc/pgjdbc/pull/1639)
 
 ## [42.2.8] (2019-09-13)
 ### Changed
@@ -71,6 +112,8 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
 ### Changed
 - `ssl=true` implies `sslmode=verify-full`, that is it requires valid server certificate [cdeeaca4](https://github.com/pgjdbc/pgjdbc/commit/cdeeaca47dc3bc6f727c79a582c9e4123099526e)
 
+targetServerType=master has been deprecated in favour of targetServerType=primary. master
+will still be accepted but not documented.
 ### Added
 - Support for `sslmode=allow/prefer/require` [cdeeaca4](https://github.com/pgjdbc/pgjdbc/commit/cdeeaca47dc3bc6f727c79a582c9e4123099526e)
 
@@ -246,4 +289,5 @@ thrown to caller to be dealt with so no need to log at this verbosity by pgjdbc 
 [42.2.6]: https://github.com/pgjdbc/pgjdbc/compare/REL42.2.5...REL42.2.6
 [42.2.7]: https://github.com/pgjdbc/pgjdbc/compare/REL42.2.6...REL42.2.7
 [42.2.8]: https://github.com/pgjdbc/pgjdbc/compare/REL42.2.7...REL42.2.8
-[Unreleased]: https://github.com/pgjdbc/pgjdbc/compare/REL42.2.8...HEAD
+[42.2.9]: https://github.com/pgjdbc/pgjdbc/compare/REL42.2.8...REL42.2.9
+[Unreleased]: https://github.com/pgjdbc/pgjdbc/compare/REL42.2.9...HEAD

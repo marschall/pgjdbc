@@ -10,6 +10,7 @@ import org.postgresql.core.BaseStatement;
 import org.postgresql.core.Encoding;
 import org.postgresql.core.Field;
 import org.postgresql.core.Oid;
+import org.postgresql.core.Tuple;
 import org.postgresql.jdbc2.ArrayAssistant;
 import org.postgresql.jdbc2.ArrayAssistantRegistry;
 import org.postgresql.util.ByteConverter;
@@ -243,6 +244,9 @@ public class PgArray implements java.sql.Array {
           case Oid.FLOAT8:
             arr[i] = ByteConverter.float8(fieldBytes, pos);
             break;
+          case Oid.NUMERIC:
+            arr[i] = ByteConverter.numeric(fieldBytes, pos, len);
+            break;
           case Oid.TEXT:
           case Oid.VARCHAR:
             Encoding encoding = connection.getEncoding();
@@ -282,7 +286,7 @@ public class PgArray implements java.sql.Array {
     if (count > 0 && dimensions > 0) {
       dims[0] = Math.min(count, dims[0]);
     }
-    List<byte[][]> rows = new ArrayList<byte[][]>();
+    List<Tuple> rows = new ArrayList<Tuple>();
     Field[] fields = new Field[2];
 
     storeValues(rows, fields, elementOid, dims, pos, 0, index);
@@ -292,7 +296,7 @@ public class PgArray implements java.sql.Array {
     return stat.createDriverResultSet(fields, rows);
   }
 
-  private int storeValues(List<byte[][]> rows, Field[] fields, int elementOid, final int[] dims,
+  private int storeValues(List<Tuple> rows, Field[] fields, int elementOid, final int[] dims,
       int pos, final int thisDimension, int index) throws SQLException {
     // handle an empty array
     if (dims.length == 0) {
@@ -323,7 +327,7 @@ public class PgArray implements java.sql.Array {
         byte[][] rowData = new byte[2][];
         rowData[0] = new byte[4];
         ByteConverter.int4(rowData[0], 0, i + index);
-        rows.add(rowData);
+        rows.add(new Tuple(rowData));
         int len = ByteConverter.int4(fieldBytes, pos);
         pos += 4;
         if (len == -1) {
@@ -347,7 +351,7 @@ public class PgArray implements java.sql.Array {
         byte[][] rowData = new byte[2][];
         rowData[0] = new byte[4];
         ByteConverter.int4(rowData[0], 0, i + index);
-        rows.add(rowData);
+        rows.add(new Tuple(rowData));
         int dataEndPos = calcRemainingDataLength(dims, pos, elementOid, nextDimension);
         int dataLength = dataEndPos - pos;
         rowData[1] = new byte[12 + 8 * dimensionsLeft + dataLength];
@@ -389,6 +393,8 @@ public class PgArray implements java.sql.Array {
         return Float.class;
       case Oid.FLOAT8:
         return Double.class;
+      case Oid.NUMERIC:
+        return BigDecimal.class;
       case Oid.TEXT:
       case Oid.VARCHAR:
         return String.class;
@@ -860,7 +866,7 @@ public class PgArray implements java.sql.Array {
           PSQLState.DATA_ERROR);
     }
 
-    List<byte[][]> rows = new ArrayList<byte[][]>();
+    List<Tuple> rows = new ArrayList<Tuple>();
 
     Field[] fields = new Field[2];
 
@@ -877,7 +883,7 @@ public class PgArray implements java.sql.Array {
         String v = (String) arrayList.get(offset);
         t[0] = connection.encodeString(Integer.toString(offset + 1));
         t[1] = v == null ? null : connection.encodeString(v);
-        rows.add(t);
+        rows.add(new Tuple(t));
       }
     } else {
       // when multi-dimensional
@@ -890,7 +896,7 @@ public class PgArray implements java.sql.Array {
 
         t[0] = connection.encodeString(Integer.toString(offset + 1));
         t[1] = v == null ? null : connection.encodeString(toString((PgArrayList) v));
-        rows.add(t);
+        rows.add(new Tuple(t));
       }
     }
 
