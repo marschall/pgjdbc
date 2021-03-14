@@ -35,6 +35,7 @@ import java.time.ZonedDateTime;
 import java.time.chrono.IsoEra;
 import java.time.format.DateTimeParseException;
 import java.time.temporal.ChronoField;
+import java.time.temporal.ChronoUnit;
 import java.util.Calendar;
 import java.util.GregorianCalendar;
 import java.util.HashMap;
@@ -59,10 +60,14 @@ public class TimestampUtils {
   private static final LocalTime MAX_TIME = LocalTime.MAX.minus(Duration.ofNanos(500));
   private static final OffsetDateTime MAX_OFFSET_DATETIME = OffsetDateTime.MAX.minus(Duration.ofMillis(500));
   private static final LocalDateTime MAX_LOCAL_DATETIME = LocalDateTime.MAX.minus(Duration.ofMillis(500));
-  // low value for dates is   4713 BC
+  // low value for dates is 4713 BC
   private static final LocalDate MIN_LOCAL_DATE = LocalDate.of(4713, 1, 1).with(ChronoField.ERA, IsoEra.BCE.getValue());
+  // high value for dates is 5874897 AD
+  private static final LocalDate MAX_LOCAL_DATE = LocalDate.of(5874897, 12, 31);
   private static final LocalDateTime MIN_LOCAL_DATETIME = MIN_LOCAL_DATE.atStartOfDay();
   private static final OffsetDateTime MIN_OFFSET_DATETIME = MIN_LOCAL_DATETIME.atOffset(ZoneOffset.UTC);
+  private static final LocalDate DATE_EPOCH = LocalDate.of(1943, 11, 28);
+  private static final LocalDate DATE_TIME_EPOCH = LocalDate.of(2000, 1, 1);
 
   private static final @Nullable Field DEFAULT_TIME_ZONE_FIELD;
 
@@ -1107,8 +1112,101 @@ public class TimestampUtils {
     } else {
       micros = ByteConverter.int8(bytes, 0);
     }
+    if (micros > 86399999999L) {
+      return LocalTime.MAX;
+    }
 
     return LocalTime.ofNanoOfDay(micros * 1000);
+  }
+
+  /**
+   * Converts the SQL LocalDate to binary representation for {@link Oid#TIME}.
+   *
+   * @param bytes The binary encoded date value.
+   * @param value value
+   * @throws PSQLException If binary format could not be parsed.
+   */
+  public void toBinTime(byte[] bytes, LocalTime value) throws PSQLException {
+
+    // Postgres resolution
+    LocalTime truncated = value.truncatedTo(ChronoUnit.MICROS);
+    long remainderNanos = ChronoUnit.NANOS.between(truncated, value);
+    long micros = ChronoUnit.MICROS.between(LocalTime.MIDNIGHT, truncated);
+    if (remainderNanos >= 500L) {
+      // round up
+      micros += 1L;
+    }
+
+    ByteConverter.int8(bytes, 0, micros);
+  }
+
+  /**
+   * Converts the SQL LocalDate to binary representation for {@link Oid#DATE}.
+   *
+   * @param bytes The binary encoded date value.
+   * @param value value
+   * @throws PSQLException If binary format could not be parsed.
+   */
+  public void toBinDate(byte[] bytes, LocalDate value) throws PSQLException {
+
+    long days;
+    if (value.compareTo(MIN_LOCAL_DATE) <= 0) {
+      days = Integer.MIN_VALUE;
+    } else if (value.compareTo(MAX_LOCAL_DATE) >= 0) {
+      days = Integer.MAX_VALUE;
+    } else {
+      days = ChronoUnit.DAYS.between(value, DATE_EPOCH);
+    }
+
+    ByteConverter.int4(bytes, 0, Math.toIntExact(days));
+  }
+
+  /**
+   * Converts the SQL LocalDateTime to binary representation for {@link Oid#TIMESTAMP}.
+   *
+   * @param bytes The binary encoded date value.
+   * @param value value
+   * @throws PSQLException If binary format could not be parsed.
+   */
+  public void toBinTimestamp(byte[] bytes, LocalDateTime value) throws PSQLException {
+
+    long micros;
+    if (value.compareTo(MIN_LOCAL_DATETIME) <= 0) {
+      micros = Long.MIN_VALUE;
+    } else if (value.compareTo(MAX_LOCAL_DATETIME) >= 0) {
+      micros = Long.MAX_VALUE;
+    } else {
+      // Postgres resolution
+      LocalDateTime truncated = value.truncatedTo(ChronoUnit.MICROS);
+      micros = ChronoUnit.MICROS.between(DATE_TIME_EPOCH.atStartOfDay(), truncated);
+      long remainderNanos = ChronoUnit.NANOS.between(truncated, value);
+      if (remainderNanos >= 500L) {
+        // round up
+        micros += 1L;
+      }
+    }
+    // Postgres resolution
+    ByteConverter.int8(bytes, 0, micros);
+  }
+
+  /**
+   * Converts the SQL OffsetDateTime to binary representation for {@link Oid#TIMESTAMPTZ}.
+   *
+   * @param bytes The binary encoded date value.
+   * @param value value
+   * @throws PSQLException If binary format could not be parsed.
+   */
+  public void toBinTimestamp(byte[] bytes, OffsetDateTime value) throws PSQLException {
+
+    LocalDateTime inUtc;
+    if (value.isBefore(MIN_OFFSET_DATETIME)) {
+      inUtc = MIN_LOCAL_DATETIME;
+    } else if (value.isAfter(MAX_OFFSET_DATETIME)) {
+      inUtc = MAX_LOCAL_DATETIME;
+    } else {
+      inUtc = value.withOffsetSameInstant(ZoneOffset.UTC).toLocalDateTime();
+    }
+    toBinTimestamp(bytes, inUtc);
   }
 
   /**

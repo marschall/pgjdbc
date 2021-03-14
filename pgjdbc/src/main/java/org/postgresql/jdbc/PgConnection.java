@@ -244,12 +244,6 @@ public class PgConnection implements BaseConnection {
 
     Set<Integer> useBinaryReceiveForOids = new HashSet<Integer>(binaryOids);
 
-    /*
-     * Does not pass unit tests because unit tests expect setDate to have millisecond accuracy
-     * whereas the binary transfer only supports date accuracy.
-     */
-    useBinarySendForOids.remove(Oid.DATE);
-
     queryExecutor.setBinaryReceiveOids(useBinaryReceiveForOids);
     queryExecutor.setBinarySendOids(useBinarySendForOids);
 

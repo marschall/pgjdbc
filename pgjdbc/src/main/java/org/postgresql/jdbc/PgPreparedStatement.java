@@ -594,7 +594,7 @@ class PgPreparedStatement extends PgStatement implements PreparedStatement {
         } else {
           java.sql.Date tmpd;
           if (in instanceof java.util.Date) {
-            tmpd = new java.sql.Date(((java.util.Date) in).getTime());
+            tmpd = getTimestampUtils().convertToDate(((java.util.Date) in).getTime(), getDefaultCalendar().getTimeZone());
           } else if (in instanceof LocalDate) {
             setDate(parameterIndex, (LocalDate) in);
             break;
@@ -1431,24 +1431,48 @@ class PgPreparedStatement extends PgStatement implements PreparedStatement {
 
   private void setDate(@Positive int i, LocalDate localDate) throws SQLException {
     int oid = Oid.DATE;
-    bindString(i, getTimestampUtils().toString(localDate), oid);
+    if (connection.binaryTransferSend(oid) && connection.getPreferQueryMode() != PreferQueryMode.SIMPLE) {
+      byte[] val = new byte[4];
+      getTimestampUtils().toBinDate(val, localDate);
+      bindBytes(i, val, oid);
+    } else {
+      bindString(i, getTimestampUtils().toString(localDate), oid);
+    }
   }
 
   private void setTime(@Positive int i, LocalTime localTime) throws SQLException {
     int oid = Oid.TIME;
-    bindString(i, getTimestampUtils().toString(localTime), oid);
+    if (connection.binaryTransferSend(oid) && connection.getPreferQueryMode() != PreferQueryMode.SIMPLE) {
+      byte[] val = new byte[8];
+      getTimestampUtils().toBinTime(val, localTime);
+      bindBytes(i, val, oid);
+    } else {
+      bindString(i, getTimestampUtils().toString(localTime), oid);
+    }
   }
 
   private void setTimestamp(@Positive int i, LocalDateTime localDateTime)
       throws SQLException {
     int oid = Oid.TIMESTAMP;
-    bindString(i, getTimestampUtils().toString(localDateTime), oid);
+    if (connection.binaryTransferSend(oid) && connection.getPreferQueryMode() != PreferQueryMode.SIMPLE) {
+      byte[] val = new byte[8];
+      getTimestampUtils().toBinTimestamp(val, localDateTime);
+      bindBytes(i, val, oid);
+    } else {
+      bindString(i, getTimestampUtils().toString(localDateTime), oid);
+    }
   }
 
   private void setTimestamp(@Positive int i, OffsetDateTime offsetDateTime)
       throws SQLException {
     int oid = Oid.TIMESTAMPTZ;
-    bindString(i, getTimestampUtils().toString(offsetDateTime), oid);
+    if (connection.binaryTransferSend(oid) && connection.getPreferQueryMode() != PreferQueryMode.SIMPLE) {
+      byte[] val = new byte[8];
+      getTimestampUtils().toBinTimestamp(val, offsetDateTime);
+      bindBytes(i, val, oid);
+    } else {
+      bindString(i, getTimestampUtils().toString(offsetDateTime), oid);
+    }
   }
 
   public ParameterMetaData createParameterMetaData(BaseConnection conn, int[] oids)

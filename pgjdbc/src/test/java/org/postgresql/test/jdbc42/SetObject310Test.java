@@ -88,7 +88,7 @@ public class SetObject310Test extends BaseTest4 {
     TestUtil.createTable(con, "table1", "timestamp_without_time_zone_column timestamp without time zone,"
             + "timestamp_with_time_zone_column timestamp with time zone,"
             + "date_column date,"
-            + "time_without_time_zone_column time without time zone,"
+            + "time_without_time_zone_column time(6) without time zone,"
             + "time_with_time_zone_column time with time zone"
     );
   }
@@ -130,6 +130,26 @@ public class SetObject310Test extends BaseTest4 {
     }
   }
 
+  private <T> T readObject(String columnName, Class<T> expectedType) throws SQLException {
+    try (Statement st = con.createStatement();
+         ResultSet rs = st.executeQuery(TestUtil.selectSQL("table1", columnName))) {
+
+      assertNotNull(rs);
+      assertTrue(rs.next());
+      return expectedType.cast(rs.getObject(1));
+    }
+  }
+
+  private <T> T readObjectClass(String columnName, Class<T> expectedType) throws SQLException {
+    try (Statement st = con.createStatement();
+         ResultSet rs = st.executeQuery(TestUtil.selectSQL("table1", columnName))) {
+
+      assertNotNull(rs);
+      assertTrue(rs.next());
+      return rs.getObject(1, expectedType);
+    }
+  }
+
   private String insertThenReadStringWithoutType(LocalDateTime data, String columnName) throws SQLException {
     insert(data, columnName, null);
     return readString(columnName);
@@ -144,54 +164,28 @@ public class SetObject310Test extends BaseTest4 {
     insert(data, columnName, null);
   }
 
+  private <T> T insertThenReadClass(Object data, String columnName, Class<T> expectedType) throws SQLException {
+    insert(data, columnName, null);
+
+    return readObjectClass(columnName, expectedType);
+  }
+
+  private <T> T insertThenReadClass(Object data, int sqlType, String columnName, Class<T> expectedType) throws SQLException {
+    insert(data, columnName, sqlType);
+
+    return readObjectClass(columnName, expectedType);
+  }
+
   private <T> T insertThenReadWithoutType(Object data, String columnName, Class<T> expectedType) throws SQLException {
-    PreparedStatement ps = con.prepareStatement(TestUtil.insertSQL("table1", columnName, "?"));
-    try {
-      ps.setObject(1, data);
-      assertEquals(1, ps.executeUpdate());
-    } finally {
-      ps.close();
-    }
+    insert(data, columnName, null);
 
-    Statement st = con.createStatement();
-    try {
-      ResultSet rs = st.executeQuery(TestUtil.selectSQL("table1", columnName));
-      try {
-        assertNotNull(rs);
-
-        assertTrue(rs.next());
-        return expectedType.cast(rs.getObject(1));
-      } finally {
-        rs.close();
-      }
-    } finally {
-      st.close();
-    }
+    return readObject(columnName, expectedType);
   }
 
   private <T> T insertThenReadWithType(Object data, int sqlType, String columnName, Class<T> expectedType) throws SQLException {
-    PreparedStatement ps = con.prepareStatement(TestUtil.insertSQL("table1", columnName, "?"));
-    try {
-      ps.setObject(1, data, sqlType);
-      assertEquals(1, ps.executeUpdate());
-    } finally {
-      ps.close();
-    }
+    insert(data, columnName, sqlType);
 
-    Statement st = con.createStatement();
-    try {
-      ResultSet rs = st.executeQuery(TestUtil.selectSQL("table1", columnName));
-      try {
-        assertNotNull(rs);
-
-        assertTrue(rs.next());
-        return expectedType.cast(rs.getObject(1));
-      } finally {
-        rs.close();
-      }
-    } finally {
-      st.close();
-    }
+    return readObject(columnName, expectedType);
   }
 
   private void deleteRows() throws SQLException {
@@ -214,11 +208,15 @@ public class SetObject310Test extends BaseTest4 {
     for (String zoneId : zoneIdsToTest) {
       ZoneId zone = ZoneId.of(zoneId);
       for (String date : datesToTest) {
+        // store and load a local date time that may not actually exist in the current time zone
+        // it must be returned "as is" since LocalDateTime has no time zone
         LocalDateTime localDateTime = LocalDateTime.parse(date);
-        String expected = localDateTime.atZone(zone)
-            .format(DateTimeFormatter.ISO_LOCAL_DATE_TIME)
-            .replace('T', ' ');
-        localTimestamps(zone, localDateTime, expected);
+        localTimestamps(zone, localDateTime);
+
+        // potentially modify the local date time so that is exists in the current time zone
+        // it must be returned "as is" since LocalDateTime has no time zone
+        localDateTime = localDateTime.atZone(zone).toLocalDateTime();
+        localTimestamps(zone, localDateTime);
       }
     }
   }
@@ -283,15 +281,24 @@ public class SetObject310Test extends BaseTest4 {
     return zoneIdsToTest;
   }
 
-  private void localTimestamps(ZoneId zoneId, LocalDateTime localDateTime, String expected) throws SQLException {
+
+
+  private void localTimestamps(ZoneId zoneId, LocalDateTime localDateTime) throws SQLException {
+    localTimestamps(zoneId, localDateTime, localDateTime);
+  }
+
+  private void localTimestamps(ZoneId zoneId, LocalDateTime localDateTime, LocalDateTime expected) throws SQLException {
     TimeZone.setDefault(TimeZone.getTimeZone(zoneId));
-    String readBack = insertThenReadStringWithoutType(localDateTime, "timestamp_without_time_zone_column");
+    // don't use #getString because that goes through PgResultSet#internalGetObject
+    // which goes through PgResultSet#getTimestamp which is bound to the JVM time zone
+    // and therefore can't represent LocalDateTime that don't exist in this time zone
+    LocalDateTime readBack = insertThenReadClass(localDateTime, "timestamp_without_time_zone_column", LocalDateTime.class);
     assertEquals(
         "LocalDateTime=" + localDateTime + ", with TimeZone.default=" + zoneId + ", setObject(int, Object)",
         expected, readBack);
     deleteRows();
 
-    readBack = insertThenReadStringWithType(localDateTime, "timestamp_without_time_zone_column");
+    readBack = insertThenReadClass(localDateTime, Types.TIMESTAMP, "timestamp_without_time_zone_column", LocalDateTime.class);
     assertEquals(
         "LocalDateTime=" + localDateTime + ", with TimeZone.default=" + zoneId + ", setObject(int, Object, TIMESTAMP)",
         expected, readBack);
@@ -328,12 +335,11 @@ public class SetObject310Test extends BaseTest4 {
   @Test
   public void testLocalDateTimeRounding() throws SQLException {
     LocalDateTime dateTime = LocalDateTime.parse("2018-12-31T23:59:59.999999500");
-    localTimestamps(ZoneOffset.UTC, dateTime, "2019-01-01 00:00:00");
+    localTimestamps(ZoneOffset.UTC, dateTime, LocalDateTime.parse("2019-01-01T00:00:00"));
   }
 
   @Test
   public void testTimeStampRounding() throws SQLException {
-    // TODO: fix for binary
     assumeBinaryModeRegular();
     LocalTime time = LocalTime.parse("23:59:59.999999500");
     Time actual = insertThenReadWithoutType(time, "time_without_time_zone_column", Time.class);
@@ -342,7 +348,6 @@ public class SetObject310Test extends BaseTest4 {
 
   @Test
   public void testTimeStampRoundingWithType() throws SQLException {
-    // TODO: fix for binary
     assumeBinaryModeRegular();
     LocalTime time = LocalTime.parse("23:59:59.999999500");
     Time actual =
@@ -363,8 +368,7 @@ public class SetObject310Test extends BaseTest4 {
     bcDates.add(LocalDateTime.parse("0997-06-30T23:59:59.999999").with(ChronoField.ERA, IsoEra.BCE.getValue()));
 
     for (LocalDateTime bcDate : bcDates) {
-      String expected = LOCAL_TIME_FORMATTER.format(bcDate);
-      localTimestamps(ZoneOffset.UTC, bcDate, expected);
+      localTimestamps(ZoneOffset.UTC, bcDate);
     }
   }
 
@@ -394,9 +398,7 @@ public class SetObject310Test extends BaseTest4 {
    * Test the behavior setObject for time columns.
    */
   @Test
-  public void testSetLocalTimeAndReadBack() throws SQLException {
-    // TODO: fix for binary mode.
-    //  Avoid micros truncation in org.postgresql.jdbc.PgResultSet#internalGetObject
+  public void testSetLocalTimeAndReadBackRegular() throws SQLException {
     assumeBinaryModeRegular();
     LocalTime data = LocalTime.parse("16:21:51.123456");
 
@@ -404,6 +406,20 @@ public class SetObject310Test extends BaseTest4 {
 
     String readBack = readString("time_without_time_zone_column");
     assertEquals("16:21:51.123456", readBack);
+  }
+
+  /**
+   * Test the behavior setObject for time columns.
+   */
+  @Test
+  public void testSetLocalTimeAndReadBackForce() throws SQLException {
+    assumeBinaryModeForce();
+    LocalTime data = LocalTime.parse("16:21:51.123456");
+
+    insert(data, "time_without_time_zone_column", Types.TIME);
+    // we have to use .getObject(int, Class) there to avoid truncation in PgResultSet#internalGetObject
+    LocalTime readBack = readObjectClass("time_without_time_zone_column", LocalTime.class);
+    assertEquals(data, readBack);
   }
 
   /**

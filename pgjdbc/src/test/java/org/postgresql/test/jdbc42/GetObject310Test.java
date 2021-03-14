@@ -124,6 +124,23 @@ public class GetObject310Test extends BaseTest4 {
   }
 
   /**
+   * Test the behavior getObject for time columns.
+   */
+  @Test
+  public void testGetLocalTimeRounding() throws SQLException {
+    try (Statement stmt = con.createStatement()) {
+      stmt.executeUpdate(TestUtil.insertSQL("table1","time_without_time_zone_column","TIME '23:59:59.999999500'"));
+
+      try (ResultSet rs = stmt.executeQuery(TestUtil.selectSQL("table1", "time_without_time_zone_column"))) {
+        assertTrue(rs.next());
+        LocalTime localTime = LocalTime.MAX;
+        assertEquals(localTime, rs.getObject("time_without_time_zone_column", LocalTime.class));
+        assertEquals(localTime, rs.getObject(1, LocalTime.class));
+      }
+    }
+  }
+
+  /**
    * Test the behavior getObject for time columns with null.
    */
   @Test
@@ -214,10 +231,19 @@ public class GetObject310Test extends BaseTest4 {
       for (String date : datesToTest) {
         localTimestamps(zone, date);
       }
+      // max value
+      localTimestamps(zone, "294276-12-31T23:59:59", LocalDateTime.of(294276, 12, 31, 23, 59, 59));
+      // min value
+      localTimestamps(zone, "4713-01-01T00:00:00 BC", LocalDate.of(4713, 1, 1).atStartOfDay().with(ChronoField.ERA, IsoEra.BCE.getValue()));
     }
+
   }
 
-  public void localTimestamps(ZoneId zoneId, String timestamp) throws SQLException {
+  private void localTimestamps(ZoneId zoneId, String timestamp) throws SQLException {
+    localTimestamps(zoneId, timestamp, LocalDateTime.parse(timestamp));
+  }
+
+  private void localTimestamps(ZoneId zoneId, String timestamp, LocalDateTime expected) throws SQLException {
     TimeZone.setDefault(TimeZone.getTimeZone(zoneId));
     Statement stmt = con.createStatement();
     try {
@@ -226,13 +252,12 @@ public class GetObject310Test extends BaseTest4 {
       ResultSet rs = stmt.executeQuery(TestUtil.selectSQL("table1", "timestamp_without_time_zone_column"));
       try {
         assertTrue(rs.next());
-        LocalDateTime localDateTime = LocalDateTime.parse(timestamp);
-        assertEquals(localDateTime, rs.getObject("timestamp_without_time_zone_column", LocalDateTime.class));
-        assertEquals(localDateTime, rs.getObject(1, LocalDateTime.class));
+        assertEquals(expected, rs.getObject("timestamp_without_time_zone_column", LocalDateTime.class));
+        assertEquals(expected, rs.getObject(1, LocalDateTime.class));
 
         //Also test that we get the correct values when retrieving the data as LocalDate objects
-        assertEquals(localDateTime.toLocalDate(), rs.getObject("timestamp_without_time_zone_column", LocalDate.class));
-        assertEquals(localDateTime.toLocalDate(), rs.getObject(1, LocalDate.class));
+        assertEquals(expected.toLocalDate(), rs.getObject("timestamp_without_time_zone_column", LocalDate.class));
+        assertEquals(expected.toLocalDate(), rs.getObject(1, LocalDate.class));
       } finally {
         rs.close();
       }
