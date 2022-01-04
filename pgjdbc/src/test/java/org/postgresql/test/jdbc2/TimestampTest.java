@@ -605,13 +605,11 @@ public class TimestampTest extends BaseTest4 {
           + TestUtil.fix(d, 2) + " "
           + TestUtil.fix(h, 2) + ":"
           + TestUtil.fix(mn, 2) + ":"
-          + TestUtil.fix(se, 2) + " ";
+          + TestUtil.fix(se, 2);
 
-      if (tz == null) {
-        dateFormat = new SimpleDateFormat("y-M-d H:m:s");
-      } else {
-        ts = ts + tz;
-        dateFormat = new SimpleDateFormat("y-M-d H:m:s z");
+      dateFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+      if (tz != null) {
+        dateFormat.setTimeZone(TimeZone.getTimeZone(tz));
       }
       java.util.Date date = dateFormat.parse(ts);
       result = new Timestamp(date.getTime());
