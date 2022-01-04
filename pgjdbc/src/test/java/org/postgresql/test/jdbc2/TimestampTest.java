@@ -62,9 +62,15 @@ public class TimestampTest extends BaseTest4 {
   @Override
   public void setUp() throws Exception {
     super.setUp();
-    TestUtil.createTable(con, TSWTZ_TABLE, "ts timestamp with time zone");
-    TestUtil.createTable(con, TSWOTZ_TABLE, "ts timestamp without time zone");
-    TestUtil.createTable(con, DATE_TABLE, "ts date");
+    TestUtil.createTable(con, TSWTZ_TABLE,
+        "id integer primary key generated always as identity, "
+        + "ts timestamp with time zone");
+    TestUtil.createTable(con, TSWOTZ_TABLE,
+        "id integer primary key generated always as identity, "
+        + "ts timestamp without time zone");
+    TestUtil.createTable(con, DATE_TABLE,
+        "id integer primary key generated always as identity, "
+        + "ts date");
     currentTZ = TimeZone.getDefault();
   }
 
@@ -84,7 +90,7 @@ public class TimestampTest extends BaseTest4 {
   public void testCalendarModification() throws SQLException {
     Calendar cal = Calendar.getInstance();
     Calendar origCal = (Calendar) cal.clone();
-    PreparedStatement ps = con.prepareStatement("INSERT INTO " + TSWOTZ_TABLE + " VALUES (?)");
+    PreparedStatement ps = con.prepareStatement("INSERT INTO " + TSWOTZ_TABLE + " (ts) VALUES (?)");
 
     ps.setDate(1, new Date(0), cal);
     ps.executeUpdate();
@@ -102,7 +108,7 @@ public class TimestampTest extends BaseTest4 {
 
     ps.close();
     Statement stmt = con.createStatement();
-    ResultSet rs = stmt.executeQuery("SELECT ts FROM " + TSWOTZ_TABLE);
+    ResultSet rs = stmt.executeQuery("SELECT ts FROM " + TSWOTZ_TABLE + " order by id asc");
     assertTrue(rs.next());
 
     rs.getDate(1, cal);
@@ -144,10 +150,10 @@ public class TimestampTest extends BaseTest4 {
     }
 
     Statement stmt = con.createStatement();
-    stmt.executeUpdate(TestUtil.insertSQL(table, "'" + strValue + "'"));
+    stmt.executeUpdate(TestUtil.insertSQL(table, "ts", "'" + strValue + "'"));
     stmt.close();
 
-    PreparedStatement ps = con.prepareStatement(TestUtil.insertSQL(table, "?"));
+    PreparedStatement ps = con.prepareStatement(TestUtil.insertSQL(table, "ts", "?"));
     ps.setTimestamp(1, new Timestamp(value));
     ps.executeUpdate();
     ps.setTimestamp(1, new Timestamp(value), cal);
@@ -155,7 +161,7 @@ public class TimestampTest extends BaseTest4 {
     ps.close();
 
     stmt = con.createStatement();
-    ResultSet rs = stmt.executeQuery("select ts from " + table);
+    ResultSet rs = stmt.executeQuery("select ts from " + table + " order by id asc");
     while (rs.next()) {
       assertEquals(strValue, rs.getString(1));
 
@@ -188,29 +194,29 @@ public class TimestampTest extends BaseTest4 {
     // Insert the three timestamp values in raw pg format
     for (int i = 0; i < 3; i++) {
       assertEquals(1,
-          stmt.executeUpdate(TestUtil.insertSQL(TSWTZ_TABLE, "'" + TS1WTZ_PGFORMAT + "'")));
+          stmt.executeUpdate(TestUtil.insertSQL(TSWTZ_TABLE, "ts", "'" + TS1WTZ_PGFORMAT + "'")));
       assertEquals(1,
-          stmt.executeUpdate(TestUtil.insertSQL(TSWTZ_TABLE, "'" + TS2WTZ_PGFORMAT + "'")));
+          stmt.executeUpdate(TestUtil.insertSQL(TSWTZ_TABLE, "ts", "'" + TS2WTZ_PGFORMAT + "'")));
       assertEquals(1,
-          stmt.executeUpdate(TestUtil.insertSQL(TSWTZ_TABLE, "'" + TS3WTZ_PGFORMAT + "'")));
+          stmt.executeUpdate(TestUtil.insertSQL(TSWTZ_TABLE, "ts", "'" + TS3WTZ_PGFORMAT + "'")));
       assertEquals(1,
-          stmt.executeUpdate(TestUtil.insertSQL(TSWTZ_TABLE, "'" + TS4WTZ_PGFORMAT + "'")));
+          stmt.executeUpdate(TestUtil.insertSQL(TSWTZ_TABLE, "ts", "'" + TS4WTZ_PGFORMAT + "'")));
     }
-    assertEquals(1, stmt.executeUpdate(TestUtil.insertSQL(TSWTZ_TABLE,
+    assertEquals(1, stmt.executeUpdate(TestUtil.insertSQL(TSWTZ_TABLE, "ts",
         "'" + tsu.toString(null, new Timestamp(tmpDate1.getTime())) + "'")));
-    assertEquals(1, stmt.executeUpdate(TestUtil.insertSQL(TSWTZ_TABLE,
+    assertEquals(1, stmt.executeUpdate(TestUtil.insertSQL(TSWTZ_TABLE, "ts",
         "'" + tsu.toString(null, new Timestamp(tmpDate2.getTime())) + "'")));
-    assertEquals(1, stmt.executeUpdate(TestUtil.insertSQL(TSWTZ_TABLE,
+    assertEquals(1, stmt.executeUpdate(TestUtil.insertSQL(TSWTZ_TABLE, "ts",
         "'" + tsu.toString(null, new Timestamp(tmpDate3.getTime())) + "'")));
-    assertEquals(1, stmt.executeUpdate(TestUtil.insertSQL(TSWTZ_TABLE,
+    assertEquals(1, stmt.executeUpdate(TestUtil.insertSQL(TSWTZ_TABLE, "ts",
         "'" + tsu.toString(null, new Timestamp(tmpDate4.getTime())) + "'")));
-    assertEquals(1, stmt.executeUpdate(TestUtil.insertSQL(TSWTZ_TABLE,
+    assertEquals(1, stmt.executeUpdate(TestUtil.insertSQL(TSWTZ_TABLE, "ts",
         "'" + tsu.toString(null, new Timestamp(tmpTime1.getTime())) + "'")));
-    assertEquals(1, stmt.executeUpdate(TestUtil.insertSQL(TSWTZ_TABLE,
+    assertEquals(1, stmt.executeUpdate(TestUtil.insertSQL(TSWTZ_TABLE, "ts",
         "'" + tsu.toString(null, new Timestamp(tmpTime2.getTime())) + "'")));
-    assertEquals(1, stmt.executeUpdate(TestUtil.insertSQL(TSWTZ_TABLE,
+    assertEquals(1, stmt.executeUpdate(TestUtil.insertSQL(TSWTZ_TABLE, "ts",
         "'" + tsu.toString(null, new Timestamp(tmpTime3.getTime())) + "'")));
-    assertEquals(1, stmt.executeUpdate(TestUtil.insertSQL(TSWTZ_TABLE,
+    assertEquals(1, stmt.executeUpdate(TestUtil.insertSQL(TSWTZ_TABLE, "ts",
         "'" + tsu.toString(null, new Timestamp(tmpTime4.getTime())) + "'")));
 
     // Fall through helper
@@ -231,7 +237,7 @@ public class TimestampTest extends BaseTest4 {
     assumeTrue(TestUtil.haveIntegerDateTimes(con));
 
     Statement stmt = con.createStatement();
-    PreparedStatement pstmt = con.prepareStatement(TestUtil.insertSQL(TSWTZ_TABLE, "?"));
+    PreparedStatement pstmt = con.prepareStatement(TestUtil.insertSQL(TSWTZ_TABLE, "ts", "?"));
 
     pstmt.setTimestamp(1, TS1WTZ);
     assertEquals(1, pstmt.executeUpdate());
@@ -310,13 +316,13 @@ public class TimestampTest extends BaseTest4 {
     // Insert the three timestamp values in raw pg format
     for (int i = 0; i < 3; i++) {
       for (String value : TS__WOTZ_PGFORMAT) {
-        assertEquals(1, stmt.executeUpdate(TestUtil.insertSQL(TSWOTZ_TABLE, "'" + value + "'")));
+        assertEquals(1, stmt.executeUpdate(TestUtil.insertSQL(TSWOTZ_TABLE, "ts", "'" + value + "'")));
       }
     }
 
     for (java.util.Date date : TEST_DATE_TIMES) {
       String stringValue = "'" + tsu.toString(null, new Timestamp(date.getTime())) + "'";
-      assertEquals(1, stmt.executeUpdate(TestUtil.insertSQL(TSWOTZ_TABLE, stringValue)));
+      assertEquals(1, stmt.executeUpdate(TestUtil.insertSQL(TSWOTZ_TABLE, "ts", stringValue)));
     }
 
     // Fall through helper
@@ -339,7 +345,7 @@ public class TimestampTest extends BaseTest4 {
     assumeMinimumServerVersion(ServerVersion.v8_4);
 
     Statement stmt = con.createStatement();
-    PreparedStatement pstmt = con.prepareStatement(TestUtil.insertSQL(TSWOTZ_TABLE, "?"));
+    PreparedStatement pstmt = con.prepareStatement(TestUtil.insertSQL(TSWOTZ_TABLE, "ts", "?"));
 
     for (Timestamp timestamp : TS__WOTZ) {
       pstmt.setTimestamp(1, timestamp);
@@ -382,7 +388,7 @@ public class TimestampTest extends BaseTest4 {
     ResultSet rs;
     Timestamp t;
 
-    rs = stmt.executeQuery("select ts from " + TSWTZ_TABLE); // removed the order by ts
+    rs = stmt.executeQuery("select ts from " + TSWTZ_TABLE + " order by id asc");
     assertNotNull(rs);
 
     for (int i = 0; i < 3; i++) {
@@ -463,7 +469,7 @@ public class TimestampTest extends BaseTest4 {
     Timestamp t;
     String tString;
 
-    ResultSet rs = stmt.executeQuery("select ts from " + TSWOTZ_TABLE); // removed the order by ts
+    ResultSet rs = stmt.executeQuery("select ts from " + TSWOTZ_TABLE + " order by id");
     assertNotNull(rs);
 
     for (int i = 0; i < 3; i++) {
